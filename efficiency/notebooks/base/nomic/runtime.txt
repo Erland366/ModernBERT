@@ -1,0 +1,4 @@
+fixed_short: 35.83 ± 0.00 seconds (batch_size: 32)
+variable_short: 35.83 ± 0.01 seconds (batch_size: 32)
+fixed_long: 1458.79 ± 0.52 seconds (batch_size: 32)
+variable_long: 1455.46 ± 0.31 seconds (batch_size: 32)

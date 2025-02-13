@@ -1,0 +1,1 @@
+fixed_short: 99.79 ± 1.79 seconds (batch_size: 396)
