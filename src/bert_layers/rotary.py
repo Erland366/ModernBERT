@@ -4,147 +4,27 @@
 # Copyright (c) 2023, Tri Dao.
 # License: Apache-2.0
 
+from typing import Optional
+
 import torch
 from einops import rearrange
-from flash_attn.ops.triton.rotary import apply_rotary
+from torch import Tensor
 
-from typing import Optional, Tuple, Union
-
-
-class ApplyRotaryEmbUnpad(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        qkv,
-        cos,
-        sin,
-        interleaved=False,
-        seqlen_offsets: Union[int, torch.Tensor] = 0,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
-    ):
-        # (total_nnz, 3, nheads, headdim)
-        total_nnz, three, nheads, headdim = qkv.shape
-        assert three == 3
-        if qkv.is_contiguous():
-            # Call 1 kernel instead of 2 kernels
-            # We need qkv to be contiguous so that when we reshape to combine (3, nheads)
-            # dimensions, we get the same tensor
-            # qk = rearrange(qkv[:, :2], "b_s t h d -> b_s (t h) d")
-            qk = qkv[:, :2].view(total_nnz, -1, headdim)
-            apply_rotary(
-                qk,
-                cos,
-                sin,
-                seqlen_offsets=seqlen_offsets,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                interleaved=interleaved,
-                inplace=True,
-            )
-        else:
-            q, k = qkv[:, 0, :, :], qkv[:, 1, :, :]
-            apply_rotary(
-                q,
-                cos,
-                sin,
-                seqlen_offsets=seqlen_offsets,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                interleaved=interleaved,
-                inplace=True,
-            )
-            apply_rotary(
-                k,
-                cos,
-                sin,
-                seqlen_offsets=seqlen_offsets,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                interleaved=interleaved,
-                inplace=True,
-            )
-
-        if isinstance(seqlen_offsets, int):
-            ctx.save_for_backward(cos, sin, cu_seqlens)
-            ctx.seqlen_offsets = seqlen_offsets
-        else:
-            ctx.save_for_backward(cos, sin, cu_seqlens, seqlen_offsets)
-            ctx.seqlen_offsets = None
-        ctx.interleaved = interleaved
-        ctx.max_seqlen = max_seqlen
-        return qkv
-
-    @staticmethod
-    def backward(ctx, do):
-        seqlen_offsets = ctx.seqlen_offsets
-        if seqlen_offsets is None:
-            cos, sin, cu_seqlens, seqlen_offsets = ctx.saved_tensors
-        else:
-            cos, sin, cu_seqlens = ctx.saved_tensors
-        if do.is_contiguous():
-            total_nnz, three, nheads, headdim = do.shape
-            # Call 1 kernel instead of 2 kernels
-            # We need dqkv to be contiguous so that when we reshape to combine (3, nheads)
-            # dimensions, we get the same tensor
-            dqk = do[:, :2].view(total_nnz, -1, headdim)
-            apply_rotary(
-                dqk,
-                cos,
-                sin,
-                seqlen_offsets=seqlen_offsets,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=ctx.max_seqlen,
-                interleaved=ctx.interleaved,
-                inplace=True,
-                conjugate=True,
-            )
-        else:
-            dq, dk = do[:, 0, :, :], do[:, 1, :, :]
-            apply_rotary(
-                dq,
-                cos,
-                sin,
-                seqlen_offsets=seqlen_offsets,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=ctx.max_seqlen,
-                interleaved=ctx.interleaved,
-                inplace=True,
-                conjugate=True,
-            )
-            apply_rotary(
-                dk,
-                cos,
-                sin,
-                seqlen_offsets=seqlen_offsets,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=ctx.max_seqlen,
-                interleaved=ctx.interleaved,
-                inplace=True,
-                conjugate=True,
-            )
-
-        return do, None, None, None, None, None, None
+from .triton.rotary import ApplyRotaryEmbUnpad
 
 
 def apply_rotary_emb_unpad(
-    qkv,
-    cos,
-    sin,
-    interleaved=False,
-    seqlen_offsets: Union[int, torch.Tensor] = 0,
-    cu_seqlens: Optional[torch.Tensor] = None,
+    qkv: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    cu_seqlens: Optional[Tensor] = None,
     max_seqlen: Optional[int] = None,
 ):
     """
     Arguments:
         qkv: (total_nnz, 3, nheads, headdim) - input tensor for packed QKV.
         cos, sin: (seqlen_rotary, rotary_dim / 2)
-        interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead
-            of 1st half and 2nd half (GPT-NeoX style).
         inplace: if True, apply rotary embedding in-place.
-        seqlen_offsets: (batch_size,) or int. Each sequence in x is shifted by this amount.
-            Most commonly used in inference when we have KV cache.
         cu_seqlens: (batch + 1,) or None
         max_seqlen: int
     Return:
@@ -152,7 +32,7 @@ def apply_rotary_emb_unpad(
     rotary_dim must be <= headdim
     Apply rotary embedding to the first rotary_dim of x.
     """
-    return ApplyRotaryEmbUnpad.apply(qkv, cos, sin, interleaved, seqlen_offsets, cu_seqlens, max_seqlen)
+    return ApplyRotaryEmbUnpad.apply(qkv, cos, sin, cu_seqlens, max_seqlen)
 
 
 class UnpaddedRotaryEmbedding(torch.nn.Module):
@@ -164,7 +44,6 @@ class UnpaddedRotaryEmbedding(torch.nn.Module):
         self,
         dim: int,
         base: float = 10000.0,
-        interleaved: bool = False,
         max_seqlen: Optional[int] = None,
         scale_base: Optional[bool] = None,
         pos_idx_in_fp32: bool = True,
@@ -172,8 +51,6 @@ class UnpaddedRotaryEmbedding(torch.nn.Module):
         dtype: Optional[torch.dtype] = None,
     ):
         """
-        interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead
-            of 1st half and 2nd half (GPT-NeoX style).
         pos_idx_in_fp32: if True, the position indices [0.0, ..., seqlen - 1] are in fp32,
             otherwise they might be in lower precision.
             This option was added because previously (before 2023-07-02), when we construct
@@ -195,7 +72,6 @@ class UnpaddedRotaryEmbedding(torch.nn.Module):
         # Generate and save the inverse frequency buffer (non trainable)
         inv_freq = self._compute_inv_freq(device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.interleaved = interleaved
         self.scale_base = scale_base
         scale = (
             (torch.arange(0, dim, 2, device=device, dtype=torch.float32) + 0.4 * dim) / (1.4 * dim)
@@ -263,19 +139,14 @@ class UnpaddedRotaryEmbedding(torch.nn.Module):
 
     def forward(
         self,
-        qkv: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        qkv: Tensor,
+        cu_seqlens: Tensor,
         max_seqlen: Optional[int] = None,
-        seqlen_offset: Union[int, torch.Tensor] = 0,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Tensor:
         """
         qkv: (total_nnz, 3, nheads, headdim)
         cu_seqlens: (batch + 1,) cumulative sequence lengths
         max_seqlen: int max seq length in the batch
-        seqlen_offset: (batch_size,) or int. Each sequence in x is shifted by this amount.
-            Most commonly used in inference when we have KV cache.
-            If it's a tensor of shape (batch_size,), then to update the cos / sin cache, one
-            should pass in max_seqlen, which will update the cos / sin cache up to that length.
         Apply rotary embedding *inplace* to qkv.
         """
         if max_seqlen is not None:
@@ -285,8 +156,6 @@ class UnpaddedRotaryEmbedding(torch.nn.Module):
             qkv,
             self._cos_cached,
             self._sin_cached,
-            interleaved=self.interleaved,
-            seqlen_offsets=seqlen_offset,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
