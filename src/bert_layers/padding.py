@@ -9,7 +9,7 @@ def unpad_input(
     attention_mask: Tensor,
     position_ids: Optional[Tensor] = None,
     labels: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, int, Optional[Tensor], Optional[Tensor]]:
+) -> Tuple[Tensor, Tensor, Tensor, int, Tensor, Optional[Tensor], Optional[Tensor]]:
     """
     Remove padding from input sequences.
 
@@ -30,6 +30,7 @@ def unpad_input(
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
     max_seqlen_in_batch = int(seqlens_in_batch.max().item())
+    used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
 
     if inputs.dim() == 2:
@@ -42,7 +43,7 @@ def unpad_input(
     unpadded_position_ids = position_ids.flatten()[indices] if position_ids is not None else None
     unpadded_labels = labels.flatten()[indices] if labels is not None else None
 
-    return unpadded_inputs, indices, cu_seqlens, max_seqlen_in_batch, unpadded_position_ids, unpadded_labels
+    return unpadded_inputs, indices, cu_seqlens, max_seqlen_in_batch, used_seqlens_in_batch, unpadded_position_ids, unpadded_labels  # fmt: skip
 
 
 def pad_input(
