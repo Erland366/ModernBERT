@@ -9,6 +9,7 @@ dependencies = [
   "torch>=2.6,<2.7",
   "mosaicml[wandb,nlp,peft]>=0.28.0,<0.30",
   "transformers>=4.43.2,<4.49",
+  "tokenizers==0.21.0",
   "mosaicml-streaming>=0.11.0",
   "datasets>=2.20.0,<3.3",
   "sentencepiece>=0.2.0",
