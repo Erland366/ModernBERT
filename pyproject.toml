@@ -1,0 +1,55 @@
+[project]
+name = "modernbert"
+description = "ModernBERT"
+authors = [{ name = "Answer.AI, LightOn, and contributors" }]
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dynamic = ["version"]
+dependencies = [
+  "torch>=2.6,<2.7",
+  "mosaicml[wandb,nlp,peft]>=0.28.0,<0.30",
+  "transformers>=4.43.2,<4.49",
+  "mosaicml-streaming>=0.11.0",
+  "datasets>=2.20.0,<3.3",
+  "sentencepiece>=0.2.0",
+  "einops==0.8.0",
+  "omegaconf>=2.2.3,<3",
+  "mosaicml-cli>=0.6.10,<1",
+  "huggingface-hub>=0.19.0,<0.29",
+  "typer<1",
+  "zstd>=1.5.6,<1.5.6.2",
+  "pytest>=7.2.1,<9",
+  "pytest-xdist>=3.1,<4",
+  "torch-optimi>=0.2",
+  "setuptools>=75.8.0",
+  "wheel>=0.45.1",
+  "numba>=0.61.0",
+]
+
+[build-system]
+requires = ["setuptools>=75.8.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project.optional-dependencies]
+flash2 = ["flash-attn>=2.7.4"]
+pylate = ["pylate>=1.1.6"]
+
+[tool.uv]
+package = false
+no-build-isolation-package = ["flash-attn"]
+override-dependencies = ["transformers>=4.49.0"]
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn"
+version = "2.7.4post1"
+requires-dist = ["torch", "einops"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-gpu" }]
+torchvision = [{ index = "pytorch-gpu" }]
+triton = [{ index = "pytorch-gpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-gpu"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true

@@ -16,22 +16,30 @@ All code used in this repository is the code used as part of our experiments for
 
 ## Setup
 
-We have fully documented the environment used to train ModernBERT, which can be installed on a GPU-equipped machine with the following commands:
+We have fully documented the environment used to train ModernBERT, which can be installed on a GPU-equipped machine using a combination of Conda and uv:
 
 ```bash
-conda env create -f environment.yaml
 # if the conda environment errors out set channel priority to flexible:
 # conda config --set channel_priority flexible
-conda activate bert24
-# if using H100s clone and build flash attention 3
+conda env create -f environment.yaml
+conda activate modernbert
+
+# This sets uv to use the active Conda environment whether using uv or uv pip commands.
+# You'll need to run this command every time you open a new terminal to run a uv command.
+export UV_PROJECT_ENVIRONMENT="$CONDA_PREFIX"
+
+# install PyTorch and other dependencies
+uv sync
+# install flash attention 2 (requires PyTorch to be installed first)
+uv sync --extra flash2 --no-cache
+
+# if using H100s clone and build flash attention 3 (model uses FA3 if installed, FA2 otherwise)
 # git clone https://github.com/Dao-AILab/flash-attention.git
 # cd flash-attention/hopper
 # python setup.py install
-# install flash attention 2 (model uses FA3+FA2 or just FA2 if FA3 isn't supported)
-pip install "flash_attn==2.6.3" --no-build-isolation
-# or download a precompiled wheel from https://github.com/Dao-AILab/flash-attention/releases/tag/v2.6.3
-# or limit the number of parallel compilation jobs
-# MAX_JOBS=8 pip install "flash_attn==2.6.3" --no-build-isolation
+
+# install optional dependencies, like PyLate
+uv sync --extra flash2 --extra pylate
 ```
 
 ## Training
