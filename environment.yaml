@@ -47,11 +47,11 @@ dependencies:
   - cuda-toolkit=12.4.1
   - cuda-tools=12.4.1
   - cuda-visual-tools=12.4.1
-  - gcc=14.2.0
-  - gcc_impl_linux-64=14.2.0
+  - gcc=13.3.0
+  - gcc_impl_linux-64=13.3.0
   - gds-tools=1.9.1.3
-  - gxx=14.2.0
-  - gxx_impl_linux-64=14.2.0
+  - gxx=13.3.0
+  - gxx_impl_linux-64=13.3.0
   - kernel-headers_linux-64=3.10.0
   - ld_impl_linux-64=2.43
   - libcublas=12.4.5.8
@@ -75,7 +75,7 @@ dependencies:
   - libexpat=2.6.4
   - libffi=3.4.6
   - libgcc=14.2.0
-  - libgcc-devel_linux-64=14.2.0
+  - libgcc-devel_linux-64=13.3.0
   - libgcc-ng=14.2.0
   - libgomp=14.2.0
   - liblzma=5.6.4
@@ -90,10 +90,10 @@ dependencies:
   - libnvjpeg=12.3.1.117
   - libnvjpeg-dev=12.3.1.117
   - libnvjpeg-static=12.3.1.117
-  - libsanitizer=14.2.0
+  - libsanitizer=13.3.0
   - libsqlite=3.49.1
   - libstdcxx=14.2.0
-  - libstdcxx-devel_linux-64=14.2.0
+  - libstdcxx-devel_linux-64=13.3.0
   - libuuid=2.38.1
   - libxcrypt=4.4.36
   - libzlib=1.3.1
@@ -103,9 +103,7 @@ dependencies:
   - pip=25.0.1
   - python=3.12.9
   - readline=8.2
-  - setuptools=75.8.2
   - sysroot_linux-64=2.17
   - tk=8.6.13
-  - tzdata=2025a
   - uv=0.6.5
   - wheel=0.45.1
