@@ -34,9 +34,10 @@ uv sync
 uv sync --extra flash2 --no-cache
 
 # if using H100s clone and build flash attention 3 (model uses FA3 if installed, FA2 otherwise)
-# git clone https://github.com/Dao-AILab/flash-attention.git
-# cd flash-attention/hopper
-# python setup.py install
+git clone -b modernbert-huge --single-branch https://github.com/AnswerDotAI/flash-attention.git
+cd flash-attention/hopper
+# raise or lower max jobs depending on RAM. 10 workers works for 128GB RAM
+MAX_JOBS=10 pip install .
 
 # install optional dependencies, like PyLate
 uv sync --extra flash2 --extra pylate
