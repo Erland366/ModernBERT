@@ -92,7 +92,7 @@ def update_batch_size_info(cfg: DictConfig):
     return cfg
 
 
-# from timm: https://github.com/huggingface/pytorch-image-models/blob/main/timm/optim/optim_factory.py
+# modified from timm: https://github.com/huggingface/pytorch-image-models/blob/main/timm/optim/optim_factory.py
 # Copyright 2019 Ross Wightman, Apache-2.0 License
 def param_groups_weight_decay(model: nn.Module, weight_decay=1e-5, no_weight_decay_list=()):
     no_weight_decay_list = set(no_weight_decay_list)
@@ -102,7 +102,7 @@ def param_groups_weight_decay(model: nn.Module, weight_decay=1e-5, no_weight_dec
         if not param.requires_grad:
             continue
 
-        if param.ndim <= 1 or name.endswith(".bias") or name in no_weight_decay_list:
+        if param.ndim <= 1 or name.endswith(".bias") or any(nd in name for nd in no_weight_decay_list):
             no_decay.append(param)
         else:
             decay.append(param)
@@ -214,7 +214,7 @@ def build_scheduler(cfg):
 
 def build_optimizer(cfg, model):
     if cfg.get("filter_bias_norm_wd", False):
-        params = param_groups_weight_decay(model, weight_decay=cfg.weight_decay)
+        params = param_groups_weight_decay(model, weight_decay=cfg.weight_decay, no_weight_decay_list=cfg.get("no_weight_decay_list", ()))  # fmt: skip
     else:
         params = model.parameters()
 
@@ -301,7 +301,7 @@ def build_dataloader(
     return data_loader
 
 
-def build_model(cfg: DictConfig):
+def build_model(cfg: DictConfig, full_model_compile: bool = False, rope_microbatch_size: int = 1):
     if cfg.name == "hf_bert":
         return hf_bert_module.create_hf_bert_mlm(
             pretrained_model_name=cfg.pretrained_model_name,
@@ -327,6 +327,8 @@ def build_model(cfg: DictConfig):
             gradient_checkpointing=cfg.get("gradient_checkpointing", None),
             recompute_metric_loss=cfg.get("recompute_metric_loss", False),
             disable_train_metrics=cfg.get("disable_train_metrics", False),
+            full_model_compile=full_model_compile,
+            rope_microbatch_size=rope_microbatch_size,
         )
     else:
         raise ValueError(f"Not sure how to build model with name={cfg.name}")
@@ -374,7 +376,27 @@ def main(cfg: DictConfig, return_trainer: bool = False, do_train: bool = True) -
 
     # Build Model
     print("Initializing model...")
-    model = build_model(cfg.model)
+    rope_microbatch_size = 1
+    global_eval_batch_size = None
+    device_eval_batch_size = None
+    device_eval_microbatch_size = None
+    if cfg.get("eval_loader", None) is not None:
+        print("Building eval loader...")
+        global_eval_batch_size = cfg.get("global_eval_batch_size", cfg.global_train_batch_size)
+        device_eval_batch_size = cfg.get("device_eval_batch_size", global_eval_batch_size // dist.get_world_size())
+        device_eval_microbatch_size = cfg.get("device_eval_microbatch_size", None)
+        if device_eval_microbatch_size is None:
+            rope_microbatch_size = device_eval_batch_size
+        else:
+            rope_microbatch_size = device_eval_microbatch_size
+    else:
+        rope_microbatch_size = cfg.device_train_microbatch_size
+
+    model = build_model(
+        cfg.model,
+        full_model_compile=cfg.get("compile_config", None) is not None,
+        rope_microbatch_size=rope_microbatch_size,
+    )
     n_params = sum(p.numel() for p in model.parameters())
     print(f"{n_params=:.4e}")
 
@@ -383,6 +405,8 @@ def main(cfg: DictConfig, return_trainer: bool = False, do_train: bool = True) -
 
     # Dataloaders
     print("Building train loader...")
+    global_eval_batch_size = None
+    device_eval_microbatch_size = None
     train_loader = build_dataloader(
         cfg=cfg.train_loader,
         tokenizer=model.tokenizer,
@@ -392,16 +416,15 @@ def main(cfg: DictConfig, return_trainer: bool = False, do_train: bool = True) -
     )
     if cfg.get("eval_loader", None) is not None:
         print("Building eval loader...")
-        global_eval_batch_size = cfg.get("global_eval_batch_size", cfg.global_train_batch_size)
         eval_loader = build_dataloader(
             cfg=cfg.eval_loader,
             tokenizer=model.tokenizer,
-            device_batch_size=cfg.get("device_eval_batch_size", global_eval_batch_size // dist.get_world_size()),
+            device_batch_size=device_eval_batch_size,
         )
         eval_evaluator = Evaluator(
             label="eval",
             dataloader=eval_loader,
-            device_eval_microbatch_size=cfg.get("device_eval_microbatch_size", None),
+            device_eval_microbatch_size=device_eval_microbatch_size,
         )
     else:
         eval_evaluator = None
@@ -462,7 +485,7 @@ def main(cfg: DictConfig, return_trainer: bool = False, do_train: bool = True) -
         load_weights_only=cfg.get("load_weights_only", False),
         python_log_level=cfg.get("python_log_level", None),
         autoresume=cfg.get("autoresume", None),
-        fsdp_config=cfg.get("fsdp_config", None),
+        parallelism_config={"fsdp": cfg.get("fsdp_config", None)} if cfg.get("fsdp_config", None) else None,
         compile_config=cfg.get("compile_config", None),
     )
 
