@@ -25,9 +25,9 @@ def _raise_if_schedule_and_max_incompatible(t_schedule: Time[int], t_max: Time[i
     _convert_time should be called on both `t_warmup` and `t_max` before this function is called. As a a result, t_warmup and t_max will not
     be TimeUnit.EPOCH.
     """
-    assert (
-        t_schedule.unit != TimeUnit.EPOCH and t_max.unit != TimeUnit.EPOCH
-    ), "t_warmup and t_max cannot be in units of EPOCH"
+    assert t_schedule.unit != TimeUnit.EPOCH and t_max.unit != TimeUnit.EPOCH, (
+        "t_warmup and t_max cannot be in units of EPOCH"
+    )
     if isinstance(t_schedule, str):
         t_schedule = Time.from_timestring(t_schedule)
     if isinstance(t_max, str):
@@ -165,6 +165,7 @@ class CosineInverseSqrtScheduler(ComposerScheduler):
         t_max (str | Time): The total duration of this scheduler. Default = ``"1dur"``.
         alpha_f (float): Final learning rate multiplier to decay to. Default = ``0.0``.
         alpha_s (float): Starting learning rate multiplier to warmup from. Default = ``0.0``.
+        alpha_c (float): Learning rate multiplier the cosine schedule would decay to if it finished. Default = ``0.1``.
         warmup_schedule (str | Schedule): Warmup schedule. Default = ``"linear"``.
         cooldown_schedule (str | Schedule): Cooldown schedule. Default = ``"linear"``.
         scale_schedules (float): SSR also scales the warmup, cosine, and cooldown periods. Default = ``False``.
@@ -178,6 +179,7 @@ class CosineInverseSqrtScheduler(ComposerScheduler):
         t_max: Union[str, Time] = "1dur",
         alpha_f: float = 0.0,
         alpha_s: float = 0.0,
+        alpha_c: float = 0.1,
         warmup_schedule: Union[str, Schedule] = Schedule.LINEAR,
         cooldown_schedule: Union[str, Schedule] = Schedule.LINEAR,
         scale_schedules: bool = False,
@@ -188,6 +190,7 @@ class CosineInverseSqrtScheduler(ComposerScheduler):
         self.t_max = t_max
         self.alpha_f = alpha_f
         self.alpha_s = alpha_s
+        self.alpha_c = alpha_c
         self.scale_schedules = scale_schedules
         self.gamma = None
         self.delta = None
@@ -224,7 +227,7 @@ class CosineInverseSqrtScheduler(ComposerScheduler):
         if v_step < v_warmup:
             return self._warmup_schedule(v_step / v_warmup, start_y=self.alpha_s, finish_y=1)
 
-        if v_step >= v_max - v_cooldown:
+        if v_cooldown > 0 and v_step >= v_max - v_cooldown:
             return self._cooldown_schedule(
                 (v_step - (v_max - v_cooldown)) / v_cooldown,
                 start_y=self.cooldown_start,
@@ -233,20 +236,21 @@ class CosineInverseSqrtScheduler(ComposerScheduler):
 
         v_adjusted_step = v_step - v_warmup
         if v_adjusted_step <= v_cosine:
-            return _cosine_schedule(0.5 * v_adjusted_step / v_cosine, finish_y=self.alpha_f)
+            return _cosine_schedule(0.5 * v_adjusted_step / v_cosine, finish_y=self.alpha_c)
         else:
             return _inverse_sqrt_schedule(v_adjusted_step, self.gamma, self.delta)
 
     def _finish_setup(self, t_max: Time[int], t_warmup: Time[int], t_cosine: Time[int], t_cooldown: Time[int]):
-        self.delta = t_cosine.value * (1 + self.alpha_f - math.pi * (1 - self.alpha_f)) / (math.pi * (1 - self.alpha_f))
-        self.gamma = (1 + self.alpha_f) / 2 * math.sqrt(t_cosine.value + self.delta)
+        self.delta = t_cosine.value * (1 + self.alpha_c - math.pi * (1 - self.alpha_c)) / (math.pi * (1 - self.alpha_c))
+        self.gamma = (1 + self.alpha_c) / 2 * math.sqrt(t_cosine.value + self.delta)
 
         self.cooldown_start = _inverse_sqrt_schedule((t_max - t_cooldown - t_warmup).value, self.gamma, self.delta)
 
         if t_cooldown.value > 0 and self.alpha_f > self.cooldown_start:
             raise ValueError(
                 f"The final learning rate multiplier alpha_f ({self.alpha_f}) must be less than the inverse "
-                f"square root value at t_max - t_cooldown ({self.cooldown_start:.4f}) to ensure continuity."
+                f"square root value at t_max - t_cooldown ({self.cooldown_start:.4f}) to ensure continuity. "
+                f"Try lowering alpha_f below alpha_c ({self.alpha_c:.4f})."
             )
 
         self._last_t_max = t_max
