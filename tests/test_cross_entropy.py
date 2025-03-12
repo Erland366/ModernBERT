@@ -12,7 +12,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # Add folder root to path to allow us to use relative imports regardless of what directory the script is run from
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.bert_layers.loss import CrossEntropyLoss as CrossEntropyLossTriton
+from src.bert_layers.loss import CrossEntropyLossCompile
 
 is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 
@@ -125,7 +125,7 @@ def test_cross_entropy_loss_triton(
         return_z_loss=return_z_loss,
     )
     ce_compiled = torch.compile(
-        CrossEntropyLossTriton(
+        CrossEntropyLossCompile(
             label_smoothing=smoothing,
             logit_scale=logit_scale,
             lse_square_scale=lse_square_scale,
