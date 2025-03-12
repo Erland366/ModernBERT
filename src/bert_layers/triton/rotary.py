@@ -182,7 +182,7 @@ class ApplyRotaryEmbUnpad(torch.autograd.Function):
             # dimensions, we get the same tensor
             # qk = rearrange(qkv[:, :2], "b_s t h d -> b_s (t h) d")
             qk = qkv[:, :2].view(total_nnz, -1, headdim)
-            apply_rotary(
+            torch.ops.modernbert.apply_rotary(
                 qk,
                 cos,
                 sin,
@@ -191,14 +191,14 @@ class ApplyRotaryEmbUnpad(torch.autograd.Function):
             )
         else:
             q, k = qkv[:, 0, :, :], qkv[:, 1, :, :]
-            apply_rotary(
+            torch.ops.modernbert.apply_rotary(
                 q,
                 cos,
                 sin,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )
-            apply_rotary(
+            torch.ops.modernbert.apply_rotary(
                 k,
                 cos,
                 sin,
@@ -219,7 +219,7 @@ class ApplyRotaryEmbUnpad(torch.autograd.Function):
             # We need dqkv to be contiguous so that when we reshape to combine (3, nheads)
             # dimensions, we get the same tensor
             dqk = do[:, :2].view(total_nnz, -1, headdim)
-            apply_rotary(
+            torch.ops.modernbert.apply_rotary(
                 dqk,
                 cos,
                 sin,
@@ -229,7 +229,7 @@ class ApplyRotaryEmbUnpad(torch.autograd.Function):
             )
         else:
             dq, dk = do[:, 0, :, :], do[:, 1, :, :]
-            apply_rotary(
+            torch.ops.modernbert.apply_rotary(
                 dq,
                 cos,
                 sin,
@@ -237,7 +237,7 @@ class ApplyRotaryEmbUnpad(torch.autograd.Function):
                 max_seqlen=ctx.max_seqlen,
                 conjugate=True,
             )
-            apply_rotary(
+            torch.ops.modernbert.apply_rotary(
                 dk,
                 cos,
                 sin,
