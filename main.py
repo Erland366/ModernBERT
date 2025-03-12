@@ -202,9 +202,11 @@ def build_scheduler(cfg):
             t_cooldown=cfg.t_cooldown,
             t_cosine=cfg.get("t_cosine", "0.25dur"),
             alpha_f=cfg.alpha_f,
+            alpha_c=cfg.get("alpha_c", cfg.alpha_f),
             alpha_s=cfg.get("alpha_s", 0.0),
             warmup_schedule=cfg.get("warmup_schedule", "linear"),
             cooldown_schedule=cfg.get("cooldown_schedule", "linear"),
+            t_max=cfg.get("t_max", "1dur"),
         )
     elif cfg.name == "one_minus_sqrt":
         return OneMinusSqrtScheduler(t_decay=cfg.t_decay, t_max=cfg.t_max, alpha_f=cfg.alpha_f)
