@@ -70,7 +70,7 @@ def _inverse_sqrt_schedule(x: Union[int, float], alpha: float = 1.0, beta: float
 
     Curve is alpha / sqrt(x + beta). Additionally, param x is clipped to the interval [0, inf)
     """
-    return alpha / math.sqrt(max(x, 0.0) + beta)
+    return alpha / math.sqrt(max(x, 1e-12) + beta)
 
 
 def _get_scheduler(scheduler_type: Schedule):
