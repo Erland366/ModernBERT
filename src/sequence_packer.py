@@ -220,9 +220,9 @@ class SequencePacker(ABC):
                         # print("Not adding, because of max_items_to_fetch")
                         break
                 incoming_batch = next(self.src_iterator)
-                assert (
-                    len(incoming_batch) <= self.src_batch_size
-                ), f"expected {len(incoming_batch)=} <= {self.src_batch_size=}"
+                assert len(incoming_batch) <= self.src_batch_size, (
+                    f"expected {len(incoming_batch)=} <= {self.src_batch_size=}"
+                )
                 for item in incoming_batch:
                     if len(item["input_ids"]) > 0:  # ignore empty sequences
                         self.buffer.append(item["input_ids"])
@@ -252,6 +252,7 @@ class SequencePacker(ABC):
 
             cu_seq_lens = [torch.tensor(x, dtype=torch.int32) for x in lst_cu_seq_lens]
             max_seq_lens = [torch.max(x[1:] - x[:-1]).item() for x in cu_seq_lens]
+            used_seqlens = [x[1:] - x[:-1] for x in cu_seq_lens]
             assert isinstance(cu_seq_lens, list), f"Unexpected {type(cu_seq_lens)=}"
             if self.suppress_masking:
                 yieldval = {
@@ -259,6 +260,7 @@ class SequencePacker(ABC):
                     "labels": None,
                     "cu_seqlens": cu_seq_lens,
                     "max_seqlen": max_seq_lens,
+                    "used_seqlens": used_seqlens,
                 }
             else:
                 (masked_batch, labels) = SequencePacker.mlm_masking(
@@ -269,6 +271,7 @@ class SequencePacker(ABC):
                     "labels": torch.from_numpy(labels),
                     "cu_seqlens": cu_seq_lens,
                     "max_seqlen": max_seq_lens,
+                    "used_seqlens": used_seqlens,
                     "attention_mask": torch.from_numpy(np.where(batch == self.pad_token_id, 0, 1)),
                 }
                 self._token_count += yieldval["attention_mask"].sum().item()
@@ -531,7 +534,9 @@ class BufferedIterator(Generic[T]):
                     return self.buffer.popleft()
 
 
-def split_packed_batch(batch: Any, microbatch_size: Union[int, float], padding_tolerance=1.0) -> Sequence:
+def split_packed_batch(
+    batch: Any, microbatch_size: Union[int, float], padding_tolerance=1.0, mark_dynamic: bool = True
+) -> Sequence:
     # NOTE: Packed sequences are already packed into a microbatch size worth of tokens.
     # So to correctly return a microbatch worth of data, we will simply return each item (i.e. microbatch_size 1)
 
@@ -540,7 +545,7 @@ def split_packed_batch(batch: Any, microbatch_size: Union[int, float], padding_t
     split_labels = [x.squeeze() for x in batch["labels"].split(1)]
     split_attention_masks = [x.squeeze() for x in batch["attention_mask"].split(1)]
     split_cu_seqlens = batch["cu_seqlens"]
-
+    split_used_seqlens = batch["used_seqlens"]
     result = []
     for i in range(num_items):
         attention_mask = split_attention_masks[i]
@@ -551,19 +556,23 @@ def split_packed_batch(batch: Any, microbatch_size: Union[int, float], padding_t
             input_ids = split_inputs[i][: last_non_pad + 1]
             labels = split_labels[i][: last_non_pad + 1]
             cu_seqlens = split_cu_seqlens[i][:-1]
+            used_seqlens = split_used_seqlens[i][:-1]
             attention_mask = attention_mask[: last_non_pad + 1]
         else:
             input_ids = split_inputs[i]
             labels = split_labels[i]
             cu_seqlens = split_cu_seqlens[i]
-
+            used_seqlens = split_used_seqlens[i]
+        if mark_dynamic:
+            torch._dynamo.mark_dynamic(cu_seqlens, index=0)
         result.append(
             {
-                "input_ids": input_ids,
-                "labels": labels,
+                "input_ids": input_ids.unsqueeze(0),
+                "labels": labels.unsqueeze(0),
                 "cu_seqlens": cu_seqlens,
                 "max_seqlen": batch["max_seqlen"][i],
-                "attention_mask": attention_mask,
+                "attention_mask": attention_mask.unsqueeze(0),
+                "used_seqlens": used_seqlens,
             }
         )
 

@@ -147,9 +147,16 @@ class FlexBertAbsoluteEmbeddings(FlexBertEmbeddingsBase):
         self,
         input_ids: torch.LongTensor,
         position_ids: Optional[torch.LongTensor] = None,
+        indices: Optional[torch.LongTensor] = None,
+        cu_seqlens: Optional[torch.LongTensor] = None,
+        max_seqlen: Optional[int] = None,
+        used_seqlens: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         if position_ids is None:
-            position_ids = self.position_ids[:, 0 : input_ids.shape[1]]
+            if max_seqlen is None:
+                position_ids = self.position_ids[:, 0 : input_ids.shape[1]]
+            else:
+                position_ids = self.position_ids[:, 0:max_seqlen]
 
         embeddings = self.tok_embeddings(input_ids)
         position_embeddings = self.position_embeddings(position_ids)
@@ -165,7 +172,7 @@ class FlexBertCompiledSansPositionEmbeddings(FlexBertEmbeddingsBase):
         super().__init__(config)
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
 
-        self.norm = get_norm_layer(config, compiled_norm=config.compile_model) if config.embed_norm else nn.Identity()
+        self.norm = get_norm_layer(config, compiled_norm=config.partial_compile) if config.embed_norm else nn.Identity()
         self.drop = nn.Dropout(config.embed_dropout_prob) if config.embed_dropout_prob > 0.0 else nn.Identity()
 
     def _init_weights(self, reset_params: bool = False):
@@ -209,10 +216,10 @@ EBB2CLS = {
 
 def get_embedding_layer(config: FlexBertConfig) -> FlexBertEmbeddingsBase:
     try:
-        if config.compile_model and config.embedding_layer == "sans_pos":
+        if config.partial_compile and config.embedding_layer == "sans_pos":
             return FlexBertCompiledSansPositionEmbeddings(config)
-        elif config.compile_model:
-            raise ValueError(f"{config.compile_model=} only supports sans_pos embeddings.")
+        elif config.partial_compile:
+            raise ValueError(f"{config.partial_compile=} only supports sans_pos embeddings.")
         return EBB2CLS[config.embedding_layer](config)
     except KeyError:
         raise ValueError(f"Invalid embeddings layer type: {config.embedding_layer=}, must be one of {EBB2CLS.keys()}.")

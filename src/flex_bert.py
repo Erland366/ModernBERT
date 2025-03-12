@@ -179,6 +179,8 @@ def create_flex_bert_mlm(
     pretrained_checkpoint: Optional[str] = None,
     recompute_metric_loss: Optional[bool] = False,
     disable_train_metrics: Optional[bool] = False,
+    full_model_compile: Optional[bool] = False,
+    rope_microbatch_size: Optional[int] = 1,
 ):
     """FlexBERT masked language model based on |:hugging_face:| Transformers.
 
@@ -250,6 +252,8 @@ def create_flex_bert_mlm(
     if isinstance(model_config, DictConfig):
         model_config = OmegaConf.to_container(model_config, resolve=True)
 
+    model_config["full_model_compile"] = full_model_compile
+    model_config["rope_microbatch_size"] = rope_microbatch_size
     config = configuration_bert_module.FlexBertConfig.from_pretrained(pretrained_model_name, **model_config)
 
     if "prenorm" in config.bert_layer:

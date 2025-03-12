@@ -1,3 +1,6 @@
+# Copyright 2024 onwards Answer.AI, LightOn, and contributors
+# License: Apache-2.0
+
 # Copyright 2022 MosaicML Examples authors
 # SPDX-License-Identifier: Apache-2.0
 
@@ -62,21 +65,20 @@ class FlexBertConfig(TransformersBertConfig):
         mlp_out_bias: bool = False,
         norm_kwargs: dict = {},
         normalization: str = "rmsnorm",
-        padding: str = "unpadded",
-        head_class_act: str = "silu",
+        head_class_act: str = "gelu",
         head_class_bias: bool = False,
         head_class_dropout: float = 0.0,
         head_class_norm: str = False,
-        head_pred_act: str = "silu",
+        head_pred_act: str = "gelu",
         head_pred_bias: bool = False,
         head_pred_dropout: float = 0.0,
         head_pred_norm: bool = True,
-        pooling_type: str = "cls",
+        pooling_type: str = "mean",
         rotary_emb_dim: int | None = None,
         rotary_emb_base: float = 10000.0,
         rotary_emb_scale_base=None,
         rotary_emb_interleaved: bool = False,
-        use_fa2: bool = True,
+        use_fa: bool = True,
         use_sdpa_attn_mask: bool = False,
         allow_embedding_resizing: bool = False,
         init_method: str = "default",
@@ -95,8 +97,10 @@ class FlexBertConfig(TransformersBertConfig):
         local_attn_rotary_emb_dim: int | None = None,
         unpad_embeddings: bool = False,
         pad_logits: bool = False,
-        compile_model: bool = False,
+        partial_compile: bool = False,
+        full_model_compile: bool = False,
         masked_prediction: bool = False,
+        rope_microbatch_size: int = 1,
         **kwargs,
     ):
         """
@@ -121,7 +125,6 @@ class FlexBertConfig(TransformersBertConfig):
             mlp_out_bias (bool): Use bias in MLP output linear layer.
             norm_kwargs (dict): Keyword arguments for normalization layers.
             normalization (str): Normalization type.
-            padding (str): Unpad inputs. Best with `use_fa2=True`.
             head_class_act (str): Activation function for classification head.
             head_class_bias (bool): Use bias in classification head linear layer(s).
             head_class_dropout (float): Dropout probability for classification head.
@@ -135,7 +138,7 @@ class FlexBertConfig(TransformersBertConfig):
             rotary_emb_base (float): Rotary embedding base.
             rotary_emb_scale_base (float): Rotary embedding scale base.
             rotary_emb_interleaved (bool): Use interleaved rotary embeddings.
-            use_fa2 (bool): Use FlashAttention2. Requires flash_attn package.
+            use_fa (bool): Use Flash Attention 2 or Flash Attention 3. Requires flash_attn package.
             use_sdpa_attn_mask (bool): Pass a mask to SDPA. This will prevent SDPA from using the PyTorch FA2 kernel.
             allow_embedding_resizing (bool): Embeddings will be automatically resized when they are smaller than the tokenizer vocab size.
             init_method (str): Model layers initialization method.
@@ -154,8 +157,10 @@ class FlexBertConfig(TransformersBertConfig):
             local_attn_rotary_emb_dim (int | None): Rotary embedding dimension for local attention. None to disable and use `rotary_emb_dim` for all layers.
             unpad_embeddings (bool): Unpad inputs before the embedding layer.
             pad_logits (bool): Pad logits after the calculating the loss.
-            compile_model (bool): Compile the subset of the model which can be compiled.
+            partial_compile (bool): Compile the subset of the model which can be compiled.
+            full_model_compile (bool): Set to True if compiling the entire model.
             masked_prediction (bool): Use only pass the masked tokens throught the final MLM layers
+            rope_microbatch_size (int): Used to speed up the compilation process.
             **kwargs: Additional keyword arguments.
         """
         super().__init__(attention_probs_dropout_prob=attention_probs_dropout_prob, **kwargs)
@@ -178,7 +183,6 @@ class FlexBertConfig(TransformersBertConfig):
         self.mlp_out_bias = mlp_out_bias
         self.norm_kwargs = norm_kwargs
         self.normalization = normalization
-        self.padding = padding
         self.head_class_act = head_class_act
         self.head_class_bias = head_class_bias
         self.head_class_dropout = head_class_dropout
@@ -192,7 +196,7 @@ class FlexBertConfig(TransformersBertConfig):
         self.rotary_emb_base = rotary_emb_base
         self.rotary_emb_scale_base = rotary_emb_scale_base
         self.rotary_emb_interleaved = rotary_emb_interleaved
-        self.use_fa2 = use_fa2
+        self.use_fa = use_fa
         self.use_sdpa_attn_mask = use_sdpa_attn_mask
         self.allow_embedding_resizing = allow_embedding_resizing
         self.init_method = init_method
@@ -211,8 +215,10 @@ class FlexBertConfig(TransformersBertConfig):
         self.local_attn_rotary_emb_dim = local_attn_rotary_emb_dim
         self.unpad_embeddings = unpad_embeddings
         self.pad_logits = pad_logits
-        self.compile_model = compile_model
+        self.partial_compile = partial_compile
+        self.full_model_compile = full_model_compile
         self.masked_prediction = masked_prediction
+        self.rope_microbatch_size = rope_microbatch_size
 
         if loss_kwargs.get("return_z_loss", False):
             if loss_function != "fa_cross_entropy":
@@ -231,8 +237,10 @@ class FlexBertConfig(TransformersBertConfig):
             )
 
         if self.sliding_window != -1:
-            if not self.use_fa2:
-                raise ValueError("Sliding window attention is only supported with FlashAttention2")
+            if not self.use_fa:
+                raise ValueError(
+                    "Sliding window attention is only supported with Flash Attention 2 or Flash Attention 3"
+                )
             if self.sliding_window % 2 != 0 and self.sliding_window % 64 != 0:
                 raise ValueError(
                     f"Sliding window must be an even number and divisible by 64: {self.sliding_window=} {self.sliding_window % 64} {self.sliding_window % 2}"
@@ -245,25 +253,13 @@ class FlexBertConfig(TransformersBertConfig):
             if self.local_attn_rotary_emb_dim is not None:
                 raise ValueError("local_attn_rotary_emb_dim must be None when sliding_window is disabled")
 
-        if self.unpad_embeddings and self.padding != "unpadded":
-            warnings.warn(
-                "`unpad_embeddings=True` requires `padding='unpadded'`. Automatically setting `padding='unpadded'`."
-            )
-            self.padding = "unpadded"
         if self.pad_logits and not self.unpad_embeddings:
             raise ValueError("`pad_logits=True` requires `unpad_embeddings=True`")
         if self.unpad_embeddings and self.embedding_layer == "absolute_pos":
             raise ValueError(f"{self.unpad_embeddings=} is incompatible with {self.embedding_layer=}")
 
+        if self.full_model_compile and self.partial_compile:
+            raise ValueError("full_model_compile and partial_compile cannot both be True")
 
-PADDING = ["unpadded", "padded"]
-
-
-def maybe_add_padding(config: FlexBertConfig, config_option: str) -> str:
-    if config.padding not in PADDING:
-        raise ValueError(f"Invalid padding type: {config.padding}, must be one of {PADDING}")
-
-    if not any(config_option.startswith(pad + "_") for pad in PADDING):
-        config_option = f"{config.padding}_{config_option}"
-
-    return config_option
+        if self.rope_microbatch_size < 1:
+            raise ValueError(f"{self.rope_microbatch_size=} must be greater than 0")

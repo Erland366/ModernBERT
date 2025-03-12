@@ -71,14 +71,10 @@ from bert_padding import index_put_first_axis
 
 from src.bert_layers.activation import get_act_fn
 from src.bert_layers.attention import (
-    FlexBertPaddedAttention,
-    FlexBertPaddedParallelAttention,
-    FlexBertPaddedRopeAttention,
-    FlexBertPaddedRopeParallelAttention,
-    FlexBertUnpadAttention,
-    FlexBertUnpadParallelAttention,
-    FlexBertUnpadRopeAttention,
-    FlexBertUnpadRopeParallelAttention,
+    FlexBertAttention,
+    FlexBertParallelAttention,
+    FlexBertRopeAttention,
+    FlexBertRopeParallelAttention,
 )
 from src.bert_layers.configuration_bert import FlexBertConfig
 from src.bert_layers.embeddings import (
@@ -101,15 +97,11 @@ from src.bert_layers.layers import (
     BertAlibiEncoder,
     BertPooler,
     BertPredictionHeadTransform,
-    FlexBertCompileUnpadPreNormLayer,
-    FlexBertPaddedEncoder,
-    FlexBertPaddedParallelPreNormLayer,
-    FlexBertPaddedPostNormLayer,
-    FlexBertPaddedPreNormLayer,
-    FlexBertUnpadEncoder,
-    FlexBertUnpadParallelPreNormLayer,
-    FlexBertUnpadPostNormLayer,
-    FlexBertUnpadPreNormLayer,
+    FlexBertCompilePreNormLayer,
+    FlexBertEncoder,
+    FlexBertParallelPreNormLayer,
+    FlexBertPostNormLayer,
+    FlexBertPreNormLayer,
     get_encoder_layer,
 )
 from src.bert_layers.loss import get_loss_fn
@@ -730,7 +722,7 @@ class FlexBertPredictionHead(nn.Module):
         self.dense = nn.Linear(config.hidden_size, config.hidden_size, config.head_pred_bias)
         self.act = get_act_fn(config.head_pred_act) if config.head_pred_act else nn.Identity()
         self.norm = (
-            get_norm_layer(config, compiled_norm=config.compile_model) if config.head_pred_norm else nn.Identity()
+            get_norm_layer(config, compiled_norm=config.partial_compile) if config.head_pred_norm else nn.Identity()
         )
 
     def _init_weights(self, reset_params: bool = False):
@@ -949,6 +941,7 @@ class FlexBertModel(FlexBertPreTrainedModel):
         indices: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        used_seqlens: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[Union[List[torch.Tensor], torch.Tensor], Optional[torch.Tensor]]:
         if attention_mask is None:
@@ -962,6 +955,7 @@ class FlexBertModel(FlexBertPreTrainedModel):
             indices=indices,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            used_seqlens=used_seqlens,
         )
 
         if self.final_norm is not None:
@@ -1016,7 +1010,7 @@ class FlexBertForMaskedLM(FlexBertPreTrainedModel):
         self.return_z_loss = config.loss_kwargs.get("return_z_loss", False)
         self.unpad_embeddings = config.unpad_embeddings
         self.pad_logits = config.pad_logits
-        self.compile_model = config.compile_model
+        self.partial_compile = config.partial_compile
         self.masked_prediction = config.masked_prediction
 
         # Initialize weights and apply final processing
@@ -1085,14 +1079,13 @@ class FlexBertForMaskedLM(FlexBertPreTrainedModel):
         labels: Optional[torch.Tensor] = None,
         ignore_index: int = -100,
     ):
-        return pad_input(
-            inputs=inputs, indices=indices, batch=batch_size, seqlen=seqlen, labels=labels, ignore_index=ignore_index
-        )
+        return pad_input(inputs=inputs, indices=indices, batch=batch_size, seqlen=seqlen, labels=labels, ignore_index=ignore_index)  # fmt: skip
 
     @torch.compile(dynamic=True)
     def compiled_head(self, output: torch.Tensor) -> torch.Tensor:
         return self.decoder(self.head(output))
 
+    # @torch.compile(dynamic=True)
     def forward(
         self,
         input_ids: Optional[torch.Tensor],
@@ -1105,6 +1098,7 @@ class FlexBertForMaskedLM(FlexBertPreTrainedModel):
         max_seqlen: Optional[int] = None,
         batch_size: Optional[int] = None,
         seq_len: Optional[int] = None,
+        used_seqlens: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[Tuple[torch.Tensor], MaskedLMOutput]:
         # labels should be a `torch.LongTensor` of shape
@@ -1123,7 +1117,7 @@ class FlexBertForMaskedLM(FlexBertPreTrainedModel):
 
         if self.unpad_embeddings and (indices is None and cu_seqlens is None and max_seqlen is None):
             batch_size, seq_len = input_ids.shape[:2]
-            input_ids, indices, cu_seqlens, max_seqlen, position_ids, labels = self.unpad_inputs(
+            input_ids, indices, cu_seqlens, max_seqlen, used_seqlens, position_ids, labels = self.unpad_inputs(
                 input_ids, attention_mask, position_ids, labels
             )
 
@@ -1134,6 +1128,7 @@ class FlexBertForMaskedLM(FlexBertPreTrainedModel):
             indices=indices,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            used_seqlens=used_seqlens,
         )
 
         if self.masked_prediction and labels is not None:
@@ -1146,7 +1141,7 @@ class FlexBertForMaskedLM(FlexBertPreTrainedModel):
             output = output[mask_tokens]
             labels = labels[mask_tokens]
 
-        if self.compile_model:
+        if self.partial_compile:
             logits = self.compiled_head(output)
         else:
             logits = self.decoder(self.head(output))
@@ -1520,9 +1515,9 @@ def init_model_from_pretrained(
     """
 
     # Tile embeddings
-    assert isinstance(
-        new_model.embeddings, type(pretrained_model.embeddings)
-    ), f"Pretrained and new_model layers must be the same type, got {type(new_model.embeddings)} and {type(pretrained_model.embeddings)}"
+    assert isinstance(new_model.embeddings, type(pretrained_model.embeddings)), (
+        f"Pretrained and new_model layers must be the same type, got {type(new_model.embeddings)} and {type(pretrained_model.embeddings)}"
+    )
     assert isinstance(
         new_model.embeddings,
         (FlexBertAbsoluteEmbeddings, FlexBertSansPositionEmbeddings, FlexBertCompiledSansPositionEmbeddings),
@@ -1536,12 +1531,12 @@ def init_model_from_pretrained(
         tile_norm(pretrained_model.embeddings.norm, new_model.embeddings.norm, mode=mode)
 
     # Tile encoder layers
-    assert isinstance(
-        pretrained_model.encoder, (FlexBertUnpadEncoder, FlexBertPaddedEncoder)
-    ), f"Unsupported encoder layer type: {type(pretrained_model.encoder)}"
-    assert isinstance(
-        new_model.encoder, type(pretrained_model.encoder)
-    ), f"Pretrained and new_model encoder layers must be the same type, got {type(new_model.encoder)} and {type(pretrained_model.encoder)}"
+    assert isinstance(pretrained_model.encoder, FlexBertEncoder), (
+        f"Unsupported encoder layer type: {type(pretrained_model.encoder)}"
+    )
+    assert isinstance(new_model.encoder, type(pretrained_model.encoder)), (
+        f"Pretrained and new_model encoder layers must be the same type, got {type(new_model.encoder)} and {type(pretrained_model.encoder)}"
+    )
 
     # Calculate the layer mapping
     pretrained_layers = len(pretrained_model.encoder.layers)
@@ -1554,20 +1549,12 @@ def init_model_from_pretrained(
         pretrained_layer = pretrained_model.encoder.layers[pretrained_idx]
 
         # first tile the PreNorm/PostNorm layers
-        assert isinstance(
-            new_model_layer, type(pretrained_layer)
-        ), f"Pretrained and new_model prenorm/postnorm layers must be the same type, got {type(new_model_layer)} and {type(pretrained_layer)}"
+        assert isinstance(new_model_layer, type(pretrained_layer)), (
+            f"Pretrained and new_model prenorm/postnorm layers must be the same type, got {type(new_model_layer)} and {type(pretrained_layer)}"
+        )
         assert isinstance(
             new_model_layer,
-            (
-                FlexBertUnpadPreNormLayer,
-                FlexBertCompileUnpadPreNormLayer,
-                FlexBertUnpadParallelPreNormLayer,
-                FlexBertUnpadPostNormLayer,
-                FlexBertPaddedPreNormLayer,
-                FlexBertPaddedParallelPreNormLayer,
-                FlexBertPaddedPostNormLayer,
-            ),
+            (FlexBertPreNormLayer, FlexBertCompilePreNormLayer, FlexBertParallelPreNormLayer, FlexBertPostNormLayer),
         ), f"Unsupported prenorm/postnorm layer type: {type(new_model_layer)}"
 
         # First tile the normalization layers
@@ -1579,20 +1566,15 @@ def init_model_from_pretrained(
             tile_norm(pretrained_layer.mlp_norm, new_model_layer.mlp_norm, mode=mode)
 
         # Then tile the attention & mlp layers
-        assert isinstance(
-            new_model_layer.attn, type(pretrained_layer.attn)
-        ), f"Pretrained and new_model attention layers must be the same type, got {type(new_model_layer.attn)} and {type(pretrained_layer.attn)}"
+        assert isinstance(new_model_layer.attn, type(pretrained_layer.attn)), (
+            f"Pretrained and new_model attention layers must be the same type, got {type(new_model_layer.attn)} and {type(pretrained_layer.attn)}"
+        )
 
         # first try the parallel attention layers
-        if isinstance(pretrained_layer, (FlexBertUnpadParallelPreNormLayer, FlexBertPaddedParallelPreNormLayer)):
+        if isinstance(pretrained_layer, FlexBertParallelPreNormLayer):
             assert isinstance(
                 pretrained_layer.attn,
-                (
-                    FlexBertUnpadParallelAttention,
-                    FlexBertPaddedParallelAttention,
-                    FlexBertUnpadRopeParallelAttention,
-                    FlexBertPaddedRopeParallelAttention,
-                ),
+                (FlexBertParallelAttention, FlexBertRopeParallelAttention),
             ), f"Parallel prenorm layer must have parallel attention layer: {type(pretrained_layer.attn)}"
             if not isinstance(pretrained_layer.mlp, (FlexBertParallelGLU)):
                 raise ValueError(f"Parallel prenorm layer must have parallel MLP layer: {type(pretrained_layer.mlp)}")
@@ -1609,15 +1591,7 @@ def init_model_from_pretrained(
             )
 
         # then try the fused attention layers
-        elif isinstance(
-            pretrained_layer.attn,
-            (
-                FlexBertUnpadAttention,
-                FlexBertPaddedAttention,
-                FlexBertUnpadRopeAttention,
-                FlexBertPaddedRopeAttention,
-            ),
-        ):
+        elif isinstance(pretrained_layer.attn, (FlexBertAttention, FlexBertRopeAttention)):
             tile_linear(pretrained_layer.attn.Wqkv, new_model_layer.attn.Wqkv, linear_type=TileLinear.wqkv, mode=mode)
         else:
             raise ValueError(f"Unsupported attention layer type: {type(pretrained_layer.attn)}")
@@ -1628,9 +1602,9 @@ def init_model_from_pretrained(
         # tile the mlp layer if the model is not using parallel attention layers
         if not isinstance(pretrained_layer.mlp, (FlexBertMLP, FlexBertGLU, FlexBertParallelGLU)):
             raise ValueError(f"Unsupported MLP layer type: {type(pretrained_layer.mlp)}")
-        assert isinstance(
-            new_model_layer.mlp, type(pretrained_layer.mlp)
-        ), f"Pretrained and new_model mlp layers must be the same type, got {type(new_model_layer.mlp)} and {type(pretrained_layer.mlp)}"
+        assert isinstance(new_model_layer.mlp, type(pretrained_layer.mlp)), (
+            f"Pretrained and new_model mlp layers must be the same type, got {type(new_model_layer.mlp)} and {type(pretrained_layer.mlp)}"
+        )
 
         # already tiled the parallel glu layer if it exists, so only need to handle mlp & glu Wi
         if isinstance(pretrained_layer.mlp, FlexBertGLU):

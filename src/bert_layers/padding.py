@@ -41,9 +41,10 @@ def unpad_input(
         unpadded_inputs = inputs.view(shape, *rest)[indices]
 
     unpadded_position_ids = position_ids.flatten()[indices] if position_ids is not None else None
-    unpadded_labels = labels.flatten()[indices] if labels is not None else None
+    unpadded_labels = labels.flatten()[indices].unsqueeze(0) if labels is not None else None
 
-    return unpadded_inputs, indices, cu_seqlens, max_seqlen_in_batch, used_seqlens_in_batch, unpadded_position_ids, unpadded_labels  # fmt: skip
+    # add a leading batch dim since torch.compile requires 3-dim tensor for autocasting
+    return unpadded_inputs.unsqueeze(0), indices, cu_seqlens, max_seqlen_in_batch, used_seqlens_in_batch, unpadded_position_ids, unpadded_labels  # fmt: skip
 
 
 def pad_input(
@@ -69,6 +70,9 @@ def pad_input(
         padded_inputs: (batch, seqlen, ...) or (batch, seqlen)
         padded_labels: (batch, seqlen) or None
     """
+    if inputs.dim() == 3:
+        inputs = inputs.squeeze(0)
+        labels = labels.squeeze(0) if labels is not None else None
     if inputs.dim() == 1:
         output = torch.zeros(batch * seqlen, dtype=inputs.dtype, device=inputs.device)
         output[indices] = inputs
