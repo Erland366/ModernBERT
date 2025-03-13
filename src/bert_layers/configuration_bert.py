@@ -101,6 +101,7 @@ class FlexBertConfig(TransformersBertConfig):
         full_model_compile: bool = False,
         masked_prediction: bool = False,
         rope_microbatch_size: int = 1,
+        fa2_local_attn: bool = False,
         **kwargs,
     ):
         """
@@ -161,6 +162,7 @@ class FlexBertConfig(TransformersBertConfig):
             full_model_compile (bool): Set to True if compiling the entire model.
             masked_prediction (bool): Use only pass the masked tokens throught the final MLM layers
             rope_microbatch_size (int): Used to speed up the compilation process.
+            fa2_local_attn (bool): Use Flash Attention 2 for local attention instead of Flash Attention 3.
             **kwargs: Additional keyword arguments.
         """
         super().__init__(attention_probs_dropout_prob=attention_probs_dropout_prob, **kwargs)
@@ -219,6 +221,7 @@ class FlexBertConfig(TransformersBertConfig):
         self.full_model_compile = full_model_compile
         self.masked_prediction = masked_prediction
         self.rope_microbatch_size = rope_microbatch_size
+        self.fa2_local_attn = fa2_local_attn
 
         if loss_kwargs.get("return_z_loss", False):
             if loss_function != "fa_cross_entropy":

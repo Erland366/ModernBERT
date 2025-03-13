@@ -298,8 +298,6 @@ class FlexBertAttention(FlexBertAttentionBase):
         self.out_drop = (
             nn.Dropout(config.attn_out_dropout_prob) if config.attn_out_dropout_prob > 0.0 else nn.Identity()
         )
-        self.use_fa2 = config.use_fa and IMPL_USE_FLASH2
-        self.use_fa3 = config.use_fa and IMPL_USE_FLASH3
         self.deterministic_fa2 = config.deterministic_fa2
         self.use_sdpa_attn_mask = config.use_sdpa_attn_mask
 
@@ -312,6 +310,13 @@ class FlexBertAttention(FlexBertAttentionBase):
                 self.sliding_window = [-1, -1]
         else:
             self.sliding_window = [config.sliding_window // 2, config.sliding_window // 2]
+
+        use_fa3 = True
+        if config.fa2_local_attn and self.sliding_window != [-1, -1]:
+            use_fa3 = False
+
+        self.use_fa2 = config.use_fa and IMPL_USE_FLASH2
+        self.use_fa3 = config.use_fa and IMPL_USE_FLASH3 and use_fa3
 
         # Warn if defaulting to pytorch because of import issues
         if config.use_fa and not self.use_fa2 and not self.use_fa3:
@@ -496,8 +501,6 @@ class FlexBertParallelAttention(FlexBertAttentionBase):
         self.out_drop = (
             nn.Dropout(config.attn_out_dropout_prob) if config.attn_out_dropout_prob > 0.0 else nn.Identity()
         )
-        self.use_fa2 = config.use_fa and IMPL_USE_FLASH2
-        self.use_fa3 = config.use_fa and IMPL_USE_FLASH3
         self.deterministic_fa2 = config.deterministic_fa2
         self.use_sdpa_attn_mask = config.use_sdpa_attn_mask
 
@@ -510,6 +513,13 @@ class FlexBertParallelAttention(FlexBertAttentionBase):
                 self.sliding_window = [-1, -1]
         else:
             self.sliding_window = [config.sliding_window // 2, config.sliding_window // 2]
+
+        use_fa3 = True
+        if config.fa2_local_attn and self.sliding_window != [-1, -1]:
+            use_fa3 = False
+
+        self.use_fa2 = config.use_fa and IMPL_USE_FLASH2
+        self.use_fa3 = config.use_fa and IMPL_USE_FLASH3 and use_fa3
 
         # Warn if defaulting to pytorch because of import issues
         if config.use_fa and not self.use_fa2 and not self.use_fa3:
@@ -703,6 +713,7 @@ class FlexBertRopeAttention(FlexBertAttentionBase):
         if config.rotary_emb_dim is None:
             config.rotary_emb_dim = self.attn_head_size
 
+        use_fa3 = True
         rotary_base = config.rotary_emb_base
         rotary_dim = config.rotary_emb_dim
         if self.sliding_window != [-1, -1]:
@@ -710,6 +721,8 @@ class FlexBertRopeAttention(FlexBertAttentionBase):
                 rotary_base = config.local_attn_rotary_emb_base
             if config.local_attn_rotary_emb_dim is not None:
                 rotary_dim = config.local_attn_rotary_emb_dim
+            if config.fa2_local_attn:
+                use_fa3 = False
 
         assert UnpaddedRotaryEmbedding is not None, "rotary_emb is not installed"
         if "no_compile" in config.attention_layer:
@@ -724,7 +737,7 @@ class FlexBertRopeAttention(FlexBertAttentionBase):
         )
 
         self.use_fa2 = config.use_fa and IMPL_USE_FLASH2
-        self.use_fa3 = config.use_fa and IMPL_USE_FLASH3
+        self.use_fa3 = config.use_fa and IMPL_USE_FLASH3 and use_fa3
         self.deterministic_fa2 = config.deterministic_fa2
         self.use_sdpa_attn_mask = config.use_sdpa_attn_mask
 
@@ -927,6 +940,7 @@ class FlexBertRopeParallelAttention(FlexBertAttentionBase):
         if config.rotary_emb_dim is None:
             config.rotary_emb_dim = self.attn_head_size
 
+        use_fa3 = True
         rotary_base = config.rotary_emb_base
         rotary_dim = config.rotary_emb_dim
         if self.sliding_window != [-1, -1]:
@@ -934,6 +948,8 @@ class FlexBertRopeParallelAttention(FlexBertAttentionBase):
                 rotary_base = config.local_attn_rotary_emb_base
             if config.local_attn_rotary_emb_dim is not None:
                 rotary_dim = config.local_attn_rotary_emb_dim
+            if config.fa2_local_attn:
+                use_fa3 = False
 
         assert UnpaddedRotaryEmbedding is not None, "rotary_emb is not installed"
         if "no_compile" in config.attention_layer:
@@ -947,7 +963,7 @@ class FlexBertRopeParallelAttention(FlexBertAttentionBase):
         )
 
         self.use_fa2 = config.use_fa and IMPL_USE_FLASH2
-        self.use_fa3 = config.use_fa and IMPL_USE_FLASH3
+        self.use_fa3 = config.use_fa and IMPL_USE_FLASH3 and use_fa3
         self.deterministic_fa2 = config.deterministic_fa2
         self.use_sdpa_attn_mask = config.use_sdpa_attn_mask
 
