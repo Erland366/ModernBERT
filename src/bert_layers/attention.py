@@ -1119,7 +1119,7 @@ def get_attention_layer(config: FlexBertConfig, layer_id: Optional[int] = None) 
             else config.attention_layer
         )
         if "no_compile" in attention_layer:
-            attention_layer = attention_layer.replace("no_compile", "")
+            attention_layer = attention_layer.replace("_no_compile", "")
         return ATTN2CLS[attention_layer](config, layer_id=layer_id)
     except KeyError:
         if layer_id < config.num_initial_layers and getattr(config, "initial_attention_layer", None) is not None:

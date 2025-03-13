@@ -308,7 +308,7 @@ def apply_rotary_emb_unpad_no_compile(
     rotary_dim must be <= headdim
     Apply rotary embedding to the first rotary_dim of x.
     """
-    return ApplyRotaryEmbUnpad.apply(qkv, cos, sin, interleaved, seqlen_offsets, cu_seqlens, max_seqlen)
+    return ApplyRotaryEmbUnpadNoCompile.apply(qkv, cos, sin, interleaved, seqlen_offsets, cu_seqlens, max_seqlen)
 
 
 class UnpaddedRotaryEmbeddingNoCompile(torch.nn.Module):
