@@ -29,7 +29,7 @@ import src.utils  # noqa: F401
 from .configuration_bert import FlexBertConfig
 from .initialization import ModuleType, init_weights
 from .normalization import get_norm_layer
-from .rotary import UnpaddedRotaryEmbedding  # type: ignore
+from .rotary import UnpaddedRotaryEmbedding, UnpaddedRotaryEmbeddingNoCompile  # type: ignore
 
 IMPL_USE_FLASH3 = False
 IMPL_USE_FLASH2 = False
@@ -712,11 +712,15 @@ class FlexBertRopeAttention(FlexBertAttentionBase):
                 rotary_dim = config.local_attn_rotary_emb_dim
 
         assert UnpaddedRotaryEmbedding is not None, "rotary_emb is not installed"
-        self.rotary_emb = UnpaddedRotaryEmbedding(
+        if "no_compile" in config.attention_layer:
+            rotary_class = UnpaddedRotaryEmbeddingNoCompile
+        else:
+            rotary_class = UnpaddedRotaryEmbedding
+        self.rotary_emb = rotary_class(
             dim=rotary_dim,
             base=rotary_base,
             scale_base=config.rotary_emb_scale_base,  # If scale_base is not None, this implements XPos (Sun et al., https://arxiv.org/abs/2212.10554).
-            max_seqlen=config.max_position_embeddings * config.micro_batch_size,
+            max_seqlen=config.max_position_embeddings * config.rope_microbatch_size,
         )
 
         self.use_fa2 = config.use_fa and IMPL_USE_FLASH2
@@ -932,7 +936,11 @@ class FlexBertRopeParallelAttention(FlexBertAttentionBase):
                 rotary_dim = config.local_attn_rotary_emb_dim
 
         assert UnpaddedRotaryEmbedding is not None, "rotary_emb is not installed"
-        self.rotary_emb = UnpaddedRotaryEmbedding(
+        if "no_compile" in config.attention_layer:
+            rotary_class = UnpaddedRotaryEmbeddingNoCompile
+        else:
+            rotary_class = UnpaddedRotaryEmbedding
+        self.rotary_emb = rotary_class(
             dim=rotary_dim,
             base=rotary_base,
             scale_base=config.rotary_emb_scale_base,  # If scale_base is not None, this implements XPos (Sun et al., https://arxiv.org/abs/2212.10554).
@@ -1110,6 +1118,8 @@ def get_attention_layer(config: FlexBertConfig, layer_id: Optional[int] = None) 
             if layer_id < config.num_initial_layers and getattr(config, "initial_attention_layer", None) is not None
             else config.attention_layer
         )
+        if "no_compile" in attention_layer:
+            attention_layer = attention_layer.replace("no_compile", "")
         return ATTN2CLS[attention_layer](config, layer_id=layer_id)
     except KeyError:
         if layer_id < config.num_initial_layers and getattr(config, "initial_attention_layer", None) is not None:

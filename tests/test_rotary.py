@@ -8,7 +8,7 @@ import math
 import pytest
 import torch
 from einops import rearrange, repeat
-from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXRotaryEmbedding
+from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXRotaryEmbedding, GPTNeoXConfig
 from transformers.models.gpt_neox.modeling_gpt_neox import apply_rotary_pos_emb as apply_rotary_pos_emb_neox
 
 # Add tests folder root to path to allow us to use relative imports regardless of what directory the script is run from
@@ -16,7 +16,12 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # Add folder root to path to allow us to use relative imports regardless of what directory the script is run from
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.bert_layers.rotary import apply_rotary_emb_unpad, UnpaddedRotaryEmbedding
+from src.bert_layers.rotary import (
+    apply_rotary_emb_unpad,
+    UnpaddedRotaryEmbedding,
+    apply_rotary_emb_unpad_no_compile,
+    UnpaddedRotaryEmbeddingNoCompile,
+)
 from src.bert_padding import pad_input, unpad_input
 
 
@@ -81,7 +86,10 @@ def index_cos_sin(cos, sin, seqlen_offsets, seqlen):
 @pytest.mark.parametrize("dtype", ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16]))
 @pytest.mark.parametrize("rotary_fraction", [1, 0.5, 0.25])
 @pytest.mark.parametrize("compile", [False, True])
-def test_rotary_emb_unpad(rotary_fraction, compile, dtype):
+@pytest.mark.parametrize("no_compile", [False, True])
+def test_rotary_emb_unpad(rotary_fraction, compile, no_compile, dtype):
+    if compile and no_compile:
+        pytest.skip("Cannot have both compile and no_compile be True")
     rtol = 1e-3
     batch_size = 16
     nheads = 4
@@ -106,6 +114,14 @@ def test_rotary_emb_unpad(rotary_fraction, compile, dtype):
     if compile:
         compiled_apply_rotary_emb_unpad = torch.compile(apply_rotary_emb_unpad)
         out_unpad = compiled_apply_rotary_emb_unpad(
+            qkv_unpad,
+            cos,
+            sin,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+    elif no_compile:
+        out_unpad = apply_rotary_emb_unpad_no_compile(
             qkv_unpad,
             cos,
             sin,
@@ -150,7 +166,8 @@ def test_rotary_emb_unpad(rotary_fraction, compile, dtype):
 @pytest.mark.parametrize("dtype", ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16]))
 @pytest.mark.parametrize("rotary_emb_fraction", [0.25, 0.5, 1.0])
 @pytest.mark.parametrize("compile", [False, True])
-def test_rotary(rotary_emb_fraction, compile, dtype):
+@pytest.mark.parametrize("no_compile", [False, True])
+def test_rotary(rotary_emb_fraction, compile, no_compile, dtype):
     device = "cuda"
     # following original flash attention test, we use higher atol
     rtol, atol = (1e-3, 5e-3) if dtype == torch.float16 else (1e-2, 5e-2)
@@ -171,9 +188,85 @@ def test_rotary(rotary_emb_fraction, compile, dtype):
     qkv_unpad = qkv_unpad.requires_grad_()
 
     qkv_og = qkv.clone().detach()  # Our implementation modifies qkv inplace
-    rotary = UnpaddedRotaryEmbedding(rotary_dim, max_seqlen=seqlen, device=device, dtype=dtype)
+    if no_compile:
+        rotary = UnpaddedRotaryEmbeddingNoCompile(rotary_dim, max_seqlen=seqlen, device=device, dtype=dtype)
+    else:
+        rotary = UnpaddedRotaryEmbedding(rotary_dim, max_seqlen=seqlen, device=device, dtype=dtype)
     if compile:
         rotary.compile()
+
+    config = GPTNeoXConfig(hidden_size=rotary_dim, max_position_embeddings=seqlen, rotary_pct=rotary_emb_fraction)
+    rotary_neox = GPTNeoXRotaryEmbedding(config, device=device)
+
+    # Doesn't matter what tensor we pass in, rotary_neox only uses the device of the tensor
+    cos_neox, sin_neox = rotary_neox(qkv, position_ids=position_ids)
+    cos_neox, sin_neox = cos_neox.to(dtype=dtype), sin_neox.to(dtype=dtype)
+    q_pt = rearrange(qkv[:, :, 0, :, :rotary_dim], "b s h d -> b h s d").detach().clone().requires_grad_(True)
+    k_pt = rearrange(qkv[:, :, 1, :, :rotary_dim], "b s h d -> b h s d").detach().clone().requires_grad_(True)
+    q_neox, k_neox = apply_rotary_pos_emb_neox(q_pt, k_pt, cos_neox, sin_neox, position_ids=position_ids)
+
+    out = rotary(qkv_unpad, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+    q_neox, *_ = unpad_input(rearrange(q_neox, "b h s d -> b s h d"), padding_mask)
+    k_neox, *_ = unpad_input(rearrange(k_neox, "b h s d -> b s h d"), padding_mask)
+
+    assert torch.allclose(rotary._cos_cached, cos_neox[..., : rotary_dim // 2].to(dtype=dtype), rtol=rtol, atol=atol)
+    assert torch.allclose(rotary._sin_cached, sin_neox[..., : rotary_dim // 2].to(dtype=dtype), rtol=rtol, atol=atol)
+    assert torch.allclose(q_neox, out[:, 0, :, :rotary_dim], rtol=rtol, atol=atol)
+    assert torch.allclose(k_neox, out[:, 1, :, :rotary_dim], rtol=rtol, atol=atol)
+
+    qkv_og_unpad, *_ = unpad_input(qkv_og, padding_mask)
+    assert torch.allclose(out[:, 0:2, :, rotary_dim:], qkv_og_unpad[:, 0:2, :, rotary_dim:])
+    assert torch.allclose(out[:, 2], qkv_og_unpad[:, 2])
+
+    g = torch.randn_like(out)
+    g_og = g.clone().detach()  # Our implementation modifies g inplace
+    out.backward(g)
+
+    q_neox.backward(g_og[:, 0, :, :rotary_dim])
+    k_neox.backward(g_og[:, 1, :, :rotary_dim])
+    assert torch.allclose(
+        rearrange(q_pt.grad, "b h s d -> b s h d"),
+        qkv.grad[:, :, 0, :, :rotary_dim],
+        rtol=rtol,
+        atol=atol,
+    )
+    assert torch.allclose(
+        rearrange(k_pt.grad, "b h s d -> b s h d"),
+        qkv.grad[:, :, 1, :, :rotary_dim],
+        rtol=rtol,
+        atol=atol,
+    )
+
+    unpadded_qkv_grad, *_ = unpad_input(qkv.grad, padding_mask)
+    assert torch.equal(unpadded_qkv_grad[:, 0:2, :, rotary_dim:], g_og[:, 0:2, :, rotary_dim:])
+    assert torch.equal(unpadded_qkv_grad[:, 2], g_og[:, 2])
+
+
+# NeoX-style rotary embedding
+@pytest.mark.parametrize("dtype", ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16]))
+@pytest.mark.parametrize("rotary_emb_fraction", [0.25, 0.5, 1.0])
+def test_rotary_no_compile(rotary_emb_fraction, dtype):
+    device = "cuda"
+    # following original flash attention test, we use higher atol
+    rtol, atol = (1e-3, 5e-3) if dtype == torch.float16 else (1e-2, 5e-2)
+    # set seed
+    batch_size = 8
+    seqlen = 2048
+    nheads = 16
+    headdim = 128
+    rotary_dim = int(headdim * rotary_emb_fraction)
+    qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, device=device, dtype=dtype, requires_grad=True)
+    lengths = torch.randint(max(1, seqlen - 20), seqlen + 1, (batch_size, 1), device=device)
+
+    padding_mask = rearrange(torch.arange(seqlen, device=device), "s -> 1 s") < lengths
+    position_ids = torch.arange(0, seqlen, dtype=torch.long, device=device)
+    position_ids = position_ids.unsqueeze(0)
+
+    qkv_unpad, indices, cu_seqlens, max_seqlen, _ = unpad_input(qkv, padding_mask)
+    qkv_unpad = qkv_unpad.requires_grad_()
+
+    qkv_og = qkv.clone().detach()  # Our implementation modifies qkv inplace
+    rotary = UnpaddedRotaryEmbeddingNoCompile(rotary_dim, max_seqlen=seqlen, device=device, dtype=dtype)
     rotary_neox = GPTNeoXRotaryEmbedding(rotary_dim, seqlen, device=device)
 
     # Doesn't matter what tensor we pass in, rotary_neox only uses the device of the tensor

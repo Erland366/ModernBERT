@@ -109,6 +109,8 @@ if CrossEntropyLossFA is not None:
 def get_loss_fn(config: FlexBertConfig) -> nn.Module:
     try:
         loss_class = LOSS2CLS[config.loss_function]
+        if config.full_model_compile and config.loss_function == "fa_cross_entropy":
+            loss_class = torch._dynamo.disable(CrossEntropyLossFA, recursive=True)
         signature = inspect.signature(loss_class)
         loss_kwargs = {k: v for k, v in config.loss_kwargs.items() if k in signature.parameters}
         return loss_class(**loss_kwargs)
