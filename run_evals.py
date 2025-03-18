@@ -30,8 +30,10 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", category=FutureWarning)
     from eval import GLUE_TASKS, SUPERGLUE_TASKS, TASK_NAME_TO_CLASS
 
+
 # Create TaskName enum dynamically from TASK_NAME_TO_CLASS keys
 TaskName = Enum("TaskName", {name: name for name in TASK_NAME_TO_CLASS.keys()}, type=str)
+
 
 app = typer.Typer(context_settings={"help_option_names": ["-h", "--help"]}, pretty_exceptions_show_locals=False)
 
@@ -55,10 +57,16 @@ def conf_callback(ctx: typer.Context, param: typer.CallbackParam, config: Option
     return config
 
 
+# Global dictionary to keep track of GPUs with running jobs
+# Changed to store more information per GPU
 gpus_in_use = {}
+# Queue to keep track of GPUs that might be free
 potentially_free_gpus = deque()
+# Global list to keep track of all running processes
 all_processes = []
-allowed_gpus = None
+
+# Global list to specify which GPUs to use
+allowed_gpus = None  # Will be set to list of GPU IDs or None
 
 console = Console()
 
@@ -79,48 +87,49 @@ def kill_process_tree(pid: int):
 
 def signal_handler(signum, frame):
     print("\nReceived termination signal. Cleaning up subprocesses...")
-    for proc in all_processes:
-        if proc.poll() is None:
-            kill_process_tree(proc.pid)
+    for process in all_processes:
+        if process.poll() is None:  # If the process is still running
+            kill_process_tree(process.pid)
+
     print("Cleanup completed. Exiting.")
-    os._exit(0)
+    os._exit(0)  # Force exit without running cleanup handlers
 
 
-def get_gpu_memory_usage(gpu_id: int) -> Optional[int]:
+def get_gpu_memory_usage(gpu_id):
+    """Get memory usage for a specific GPU."""
     try:
-        out = (
+        output = (
             subprocess.check_output(
-                f"nvidia-smi --query-gpu=memory.used --format=csv,nounits,noheader -i {gpu_id}",
-                shell=True
+                f"nvidia-smi --query-gpu=memory.used --format=csv,nounits,noheader -i {gpu_id}", shell=True
             )
             .decode("utf-8")
             .strip()
         )
-        return int(out)
+        return int(output)
     except subprocess.CalledProcessError:
         print(f"Failed to get memory usage for GPU {gpu_id}")
         return None
 
 
-def get_free_gpu() -> Optional[int]:
+def get_free_gpu():
+    """Check for free GPUs, prioritizing potentially free GPUs."""
     global allowed_gpus
     while potentially_free_gpus:
         gpu_id = potentially_free_gpus.popleft()
         if (allowed_gpus is None or gpu_id in allowed_gpus) and gpu_id not in gpus_in_use:
-            used = get_gpu_memory_usage(gpu_id)
-            if used is not None and used < 100:
+            memory_used = get_gpu_memory_usage(gpu_id)
+            if memory_used is not None and memory_used < 100:
                 return gpu_id
 
+    # If no potentially free GPUs, check allowed GPUs
     try:
         gpu_output = subprocess.check_output(
             "nvidia-smi --query-gpu=index,memory.used --format=csv,nounits,noheader", shell=True
         ).decode("utf-8")
         for line in gpu_output.strip().split("\n"):
-            g_id_str, mem_str = line.split(",")
-            g_id_int = int(g_id_str)
-            mem_used = int(mem_str)
-            if (allowed_gpus is None or g_id_int in allowed_gpus) and mem_used < 100 and g_id_int not in gpus_in_use:
-                return g_id_int
+            gpu_id, memory_used = map(int, line.split(","))
+            if (allowed_gpus is None or gpu_id in allowed_gpus) and memory_used < 100 and gpu_id not in gpus_in_use:
+                return gpu_id
         return None
     except subprocess.CalledProcessError:
         print("Failed to execute nvidia-smi")
@@ -129,37 +138,46 @@ def get_free_gpu() -> Optional[int]:
 
 def run_subprocess(cmd: List[str], verbose: bool = False, show_errors: bool = False):
     stdout = None if verbose else subprocess.DEVNULL
-    stderr = None if (verbose or show_errors) else subprocess.DEVNULL
-    proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr)
-    all_processes.append(proc)
-    proc.wait()
+    stderr = None if verbose or show_errors else subprocess.DEVNULL
+    process = subprocess.Popen(cmd, stdout=stdout, stderr=stderr)
+    all_processes.append(process)  # Add the process to the global list
+    process.wait()
 
 
 def handle_process_completion(process, stderr_file, config_path: Path, verbose: bool, gpu_id: Optional[int] = None):
-    code = process.returncode
+    """Handles the completion of a process, checks for errors, cleans up stderr_file, and logs messages."""
+    returncode = process.returncode
+
+    # Read and clean up stderr output
     if stderr_file is not None:
         stderr_file.seek(0)
-        error_out = stderr_file.read()
+        error_output = stderr_file.read()
         stderr_file.close()
-        os.unlink(stderr_file.name)
+        os.unlink(stderr_file.name)  # Delete the temp file
     else:
-        error_out = "Error output was displayed above."
+        error_output = "Error output was displayed above."
 
-    job_label = f"Job for {config_path.name}" if gpu_id is None else f"Job on GPU {gpu_id} for {config_path.name}"
+    # Construct job identifier
+    if gpu_id is not None:
+        job_identifier = f"Job on GPU {gpu_id} for {config_path.name}"
+    else:
+        job_identifier = f"Job for {config_path.name}"
 
-    if code != 0:
+    if returncode != 0:
+        # The process exited with an error
         if verbose:
-            print(f"{job_label} failed with return code {code}")
+            print(f"{job_identifier} failed with return code {returncode}")
             print("Error Output:")
-            print(error_out)
+            print(error_output)
         else:
-            console.print(f"[red]{job_label} failed with return code {code}[/red]")
-            console.print(f"[red]Error Output:[/red]\n{error_out}")
+            console.print(f"[red]{job_identifier} failed with return code {returncode}[/red]")
+            console.print(f"[red]Error Output:[/red]\n{error_output}")
     else:
+        # The process completed successfully
         if verbose:
-            print(f"{job_label} finished successfully.")
+            print(f"{job_identifier} has finished successfully.")
         else:
-            console.log(f"{job_label} has finished successfully.")
+            console.log(f"{job_identifier} has finished successfully.")
 
 
 def run_job(
@@ -169,17 +187,19 @@ def run_job(
     gpu_id: Optional[int] = None,
     gpu_ids: Optional[List[int]] = None,
 ):
+    """Run a job with optional GPU management."""
     if gpu_id is not None:
+        # GPU management is required
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     elif gpu_ids is not None:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
     else:
-        env = None
+        env = None  # Use default environment
 
     if verbose:
-        stdout = None
+        stdout = None  # Output will be shown directly
         stderr = None
         stderr_file = None
     else:
@@ -187,59 +207,69 @@ def run_job(
         stderr_file = tempfile.NamedTemporaryFile(mode="w+", delete=False)
         stderr = stderr_file
 
-    proc = subprocess.Popen(["python", "eval.py", str(config_path)], env=env, stdout=stdout, stderr=stderr)
-    all_processes.append(proc)
+    process = subprocess.Popen(["python", "eval.py", str(config_path)], env=env, stdout=stdout, stderr=stderr)
+    all_processes.append(process)  # Add the process to the global list
 
     if gpu_id is not None:
-        gpus_in_use[gpu_id] = {"process": proc, "stderr_file": stderr_file, "config": config_path}
+        # Store process info for GPU management
+        gpus_in_use[gpu_id] = {"process": process, "stderr_file": stderr_file, "config": config_path}
+
     else:
-        proc.wait()
-        handle_process_completion(proc, stderr_file, config_path, verbose, gpu_id=None)
+        process.wait()
+        handle_process_completion(process, stderr_file, config_path, verbose, gpu_id=None)
         if delete_eval_yamls:
             config_path.unlink()
 
-    return proc
+    return process
 
 
 def check_finished_jobs(verbose: bool = False):
-    done_gpus = []
+    """Check for finished jobs and free up their GPUs."""
+    finished_gpus = []
     for gpu_id, info in gpus_in_use.items():
         process = info["process"]
         stderr_file = info["stderr_file"]
         config = info["config"]
 
-        if process.poll() is not None:
+        if process.poll() is not None:  # Job has finished
+            # Handle process completion
             handle_process_completion(process, stderr_file, config, verbose, gpu_id=gpu_id)
-            done_gpus.append(gpu_id)
+            finished_gpus.append(gpu_id)
 
-    for g in done_gpus:
-        del gpus_in_use[g]
-        potentially_free_gpus.append(g)
+    for gpu_id in finished_gpus:
+        del gpus_in_use[gpu_id]
+        potentially_free_gpus.append(gpu_id)
 
 
 def manage_jobs(configs: List[Path], verbose: bool = False, delete_eval_yamls: bool = True):
+    """Manage the launching of jobs for each configuration file in the directory."""
+
     if verbose:
-        for cfg in configs:
+        for config in configs:
             while True:
                 check_finished_jobs(verbose)
-                free = get_free_gpu()
-                if free is not None:
+                gpu_id = get_free_gpu()
+                if gpu_id is not None:
                     time.sleep(random.randint(0, 5))
-                    print(f"\nLaunching job for {cfg} on GPU {free}\n")
-                    run_job(cfg, gpu_id=free, verbose=verbose, delete_eval_yamls=delete_eval_yamls)
+                    print(f"\nLaunching job for {config} on GPU {gpu_id}\n")
+                    run_job(config, gpu_id=gpu_id, verbose=verbose, delete_eval_yamls=delete_eval_yamls)
                     break
                 else:
                     time.sleep(10)
+
+        # Wait for all remaining jobs to finish
         while gpus_in_use:
             check_finished_jobs(verbose)
             time.sleep(10)
     else:
+
         def update_progress_for_finished_jobs():
-            for gpuid, info in list(gpus_in_use.items()):
-                prc = info["process"]
-                if prc.poll() is not None:
-                    if gpuid in gpu_tasks:
-                        gpu_progress.update(gpu_tasks[gpuid], completed=1, visible=False)
+            """Update progress bars for any finished GPU jobs."""
+            for gpu_id, info in list(gpus_in_use.items()):
+                process = info["process"]
+                if process.poll() is not None:  # Job finished
+                    if gpu_id in gpu_tasks:
+                        gpu_progress.update(gpu_tasks[gpu_id], completed=1, visible=False)
                         completed_configs.add(info["config"])
                         overall_progress.update(overall_task, completed=len(completed_configs))
 
@@ -250,40 +280,41 @@ def manage_jobs(configs: List[Path], verbose: bool = False, delete_eval_yamls: b
             TextColumn("[progress.percentage]{task.completed}/{task.total}"),
             TimeElapsedColumn(),
         )
+
         gpu_progress = Progress(
             SpinnerColumn(), TextColumn("[progress.description]{task.description}"), TimeElapsedColumn()
         )
 
         progress_group = Group(
             Panel(overall_progress, title="Overall Progress", border_style="blue", padding=(1, 1)),
-            Panel(gpu_progress, title="GPU Jobs", border_style="green", padding=(1, 1))
+            Panel(gpu_progress, title="GPU Jobs", border_style="green", padding=(1, 1)),
         )
 
         with Live(progress_group, console=console, refresh_per_second=4):
             overall_task = overall_progress.add_task("[cyan]Overall Progress", total=len(configs))
             gpu_tasks = {}
-            completed_configs = set()
+            completed_configs = set()  # Track completed configs
 
-            for cfg in configs:
+            for config in configs:
                 while True:
                     check_finished_jobs(verbose)
                     update_progress_for_finished_jobs()
 
-                    free = get_free_gpu()
-                    if free is not None:
+                    gpu_id = get_free_gpu()
+                    if gpu_id is not None:
                         time.sleep(random.randint(0, 5))
-                        if free not in gpu_tasks:
-                            gpu_tasks[free] = gpu_progress.add_task(f"[green]GPU {free}", total=1)
+                        if gpu_id not in gpu_tasks:
+                            gpu_tasks[gpu_id] = gpu_progress.add_task(f"[green]GPU {gpu_id}", total=1)
                         else:
-                            gpu_progress.update(gpu_tasks[free], completed=1, visible=False)
-                            gpu_tasks[free] = gpu_progress.add_task(f"[green]GPU {free}", total=1)
-
-                        gpu_progress.update(gpu_tasks[free], description=f"[green]GPU {free}: {cfg.name}")
-                        run_job(cfg, gpu_id=free, verbose=verbose, delete_eval_yamls=delete_eval_yamls)
+                            gpu_progress.update(gpu_tasks[gpu_id], completed=1, visible=False)
+                            gpu_tasks[gpu_id] = gpu_progress.add_task(f"[green]GPU {gpu_id}", total=1)
+                        gpu_progress.update(gpu_tasks[gpu_id], description=f"[green]GPU {gpu_id}: {config.name}")
+                        run_job(config, gpu_id=gpu_id, verbose=verbose, delete_eval_yamls=delete_eval_yamls)
                         break
                     else:
                         time.sleep(10)
 
+            # Wait for all remaining jobs to finish
             while gpus_in_use:
                 check_finished_jobs(verbose)
                 update_progress_for_finished_jobs()
@@ -292,56 +323,70 @@ def manage_jobs(configs: List[Path], verbose: bool = False, delete_eval_yamls: b
             overall_progress.update(overall_task, completed=len(configs))
 
     if delete_eval_yamls:
-        for c in configs:
+        for config in configs:
             try:
-                c.unlink()
+                config.unlink()
             except FileNotFoundError:
                 pass
 
 
 def create_symlink_for_newest_checkpoint(folder: Path, override_existing: bool = False):
-    if not folder.is_dir():
-        return
-
-    pt_files = list(folder.glob("*.pt"))
-    if not pt_files:
-        print(f"   Warning: No .pt file found in {folder}, skipping symlink creation.")
-        return
-
-    if len(pt_files) == 1 and pt_files[0].name == "latest-rank0.pt" and not pt_files[0].is_symlink():
-        print(f"   Only found one .pt in {folder.name}, named 'latest-rank0.pt' (real file). Skipping symlink creation.")
-        return
-
-    def extract_nums(fp: Path):
-        m = re.search(r"ep(\d+)-ba(\d+)", fp.stem)
-        if m:
-            ep, ba = map(int, m.groups())
-            return (ep, ba)
-        return (0, 0)
-
-    newest_file = max(pt_files, key=extract_nums)
-    symlink_path = folder / "latest-rank0.pt"
-
-    if symlink_path.is_symlink():
-        if symlink_path.resolve() == newest_file.resolve():
-            print(f"   Existing symlink in {folder.name} already points to {newest_file.name}")
+    """Create a symlink to the newest checkpoint file if 'latest-rank0.pt' does not exist."""
+    if folder.is_dir():
+        pt_files = list(folder.glob("*.pt"))
+        if not pt_files:
+            print(f"   Warning: No .pt file found in {folder}, skipping symlink creation.")
             return
-        else:
-            print(f"   Warning: symlink in {folder.name} points to {symlink_path.resolve().name}, but newest is {newest_file.name}")
+
+        if len(pt_files) == 1 and pt_files[0].name == "latest-rank0.pt" and not pt_files[0].is_symlink():
+            print(f"   Only found one .pt in {folder.name}, named 'latest-rank0.pt' (real file). Skipping symlink creation.")
+            return
+
+        # Sort files based on epoch and batch numbers extracted from filenames
+        def extract_numbers(filename: Path):
+            if filename.is_symlink():
+                return (0, 0)
+            if filename.name == "latest-rank0.pt":
+                return (0, 0)
+
+            try:
+                # Using regex to find patterns of 'ep' followed by digits and 'ba' followed by digits
+                match = re.search(r"ep(\d+)-ba(\d+)", filename.stem)
+                if match:
+                    epoch, batch = map(int, match.groups())
+                    return (epoch, batch)
+                else:
+                    raise ValueError(f"Filename does not match expected pattern: {filename}")
+            except Exception as e:
+                print(f"   Error extracting numbers from filename {filename}: {e}")
+                return (0, 0)
+
+        newest_file = max(pt_files, key=extract_numbers)
+
+        symlink_path = folder / "latest-rank0.pt"
+        if symlink_path.is_symlink():
+            if symlink_path.resolve() == newest_file.resolve():
+                print(f"   Existing symlink in {folder.name} already points to {newest_file.name}")
+                return
+            else:
+                print(
+                    f"   Warning: symlink in {folder.name} points to {symlink_path.resolve().name}, "
+                    f"but newest is {newest_file.name}"
+                )
+                if not override_existing:
+                    return
+                symlink_path.unlink(missing_ok=True)
+        elif symlink_path.exists():
             if not override_existing:
+                print(f"   {symlink_path.name} is a real file in {folder.name}. Use override to remove it.")
                 return
             symlink_path.unlink(missing_ok=True)
-    elif symlink_path.exists():
-        if not override_existing:
-            print(f"   {symlink_path.name} is a real file in {folder.name}. Use override to remove it.")
-            return
-        symlink_path.unlink(missing_ok=True)
 
-    symlink_path.symlink_to(newest_file.name)
-    if override_existing:
-        print(f"   Overwrote symlink {symlink_path.name} -> {newest_file.name}")
-    else:
-        print(f"   Created new symlink {symlink_path.name} -> {newest_file.name}")
+        symlink_path.symlink_to(newest_file.name)
+        if override_existing:
+            print(f"   Overwrote symlink {symlink_path.name} -> {newest_file.name}")
+        else:
+            print(f"   Created new symlink {symlink_path.name} -> {newest_file.name}")
 
 
 def generate_eval_configs(
@@ -356,7 +401,7 @@ def generate_eval_configs(
     head_class_act: Optional[str],
     head_class_norm: Optional[str],
     head_class_dropout: float,
-    tasks: Optional[List[Union[TaskName, str]]],
+    tasks: Optional[List[Union[TaskName, str]]],  # type: ignore
     fast_ultrafeedback: bool,
     seeds: List[int],
     parallel: bool,
@@ -365,21 +410,30 @@ def generate_eval_configs(
     rope_theta: Optional[float],
     gpu_ids: Optional[List[int]] = None,
 ):
+    """Generate evaluation configs for each checkpoint."""
+
     folders = [
-        f
-        for f in checkpoints.glob("*")
-        if f.is_dir() and not f.name.startswith(".") and any(x.suffix == ".pt" for x in f.glob("*.pt"))
+        folder
+        for folder in checkpoints.glob("*")
+        if folder.is_dir()
+        and not folder.name.startswith(".")
+        and any(file.suffix == ".pt" for file in folder.glob("*.pt"))
     ]
     if use_dir_names is None and len(folders) > 1:
         use_dir_names = True
-        print("Using folder names as run names since multiple checkpoint folders found.")
+        print("Using folder names as run names since multiple `checkpoints` were provided with one `train_config`.")
 
     for folder in folders:
         cmd = [
-            "python", "generate_eval_config.py",
-            "--checkpoint", str(folder),
-            "--output-dir", str(checkpoints),
+            "python",
+            "generate_eval_config.py",
+            "--checkpoint",
+            str(folder),
+            "--output-dir",
+            str(checkpoints),
         ]
+
+        # Add optional arguments if they're provided
         if use_dir_names:
             cmd.append("--use-dir-name")
         if model_size:
@@ -399,6 +453,7 @@ def generate_eval_configs(
             if track_run_project:
                 cmd.extend(["--track-run-project", track_run_project])
 
+        # Classification head options
         if pooling_type:
             cmd.extend(["--pooling-type", pooling_type])
         if head_class_act:
@@ -408,7 +463,7 @@ def generate_eval_configs(
         if head_class_dropout > 0:
             cmd.extend(["--head-class-dropout", str(head_class_dropout)])
 
-        # Handle tasks as either TaskName or str
+        # Add tasks
         if tasks:
             for task in tasks:
                 if hasattr(task, "value"):
@@ -424,12 +479,12 @@ def generate_eval_configs(
 
         if parallel:
             cmd.append("--parallel")
-        else:
-            cmd.append("--single")
 
         if gpu_ids:
             if isinstance(gpu_ids, int): gpu_ids = [gpu_ids]
             for g in gpu_ids: cmd.extend(["--gpu-ids", str(g)])
+
+        # Run the config generation process without suppressing output
 
         run_subprocess(cmd, show_errors=True)
         if not train_config:
@@ -444,7 +499,7 @@ def download_dataset(dataset_name: str, subset: Optional[str] = None):
         return f"Error in processing {dataset_name}: {e}"
 
 
-def download_datasets(tasks: List[Union[TaskName, str]], msg_queue):
+def download_datasets(tasks: List[Union[TaskName, str]], msg_queue):  # type: ignore
     try:
         required_datasets = []
         task_to_datasets = {
@@ -467,32 +522,42 @@ def download_datasets(tasks: List[Union[TaskName, str]], msg_queue):
                 extras = task_to_datasets.get(task_val, [])
                 required_datasets.extend(extras)
 
+        # Suppress output globally in this process
         import sys
+
         sys.stdout = open(os.devnull, "w")
         sys.stderr = open(os.devnull, "w")
 
         msgs = []
-        for ds_name, subset in required_datasets:
-            datasets.load_dataset(ds_name, subset, trust_remote_code=True)
-            msgs.append(f"Successfully downloaded {ds_name} {subset}")
-        msg_queue.put("\n    ".join([""] + msgs))
+        for dataset_name, subset in required_datasets:
+            datasets.load_dataset(dataset_name, subset, trust_remote_code=True)
+            msgs.append(f"Successfully downloaded {dataset_name} {subset}")
+        msg_queue.put("    " + "\n    ".join(msgs) + "\n")
     except Exception as e:
         msg_queue.put(f"Error in downloading datasets: {e}")
 
 
 def find_checkpoint_file(file_path: str, repo_files: List[str]) -> Optional[str]:
     import re
-    valid = [f for f in repo_files if f.startswith(file_path) and f.endswith((".pt", ".yaml"))]
-    if len(valid) == 1:
-        return valid[0]
 
-    def extract_nums(fn: str):
-        m = re.search(r"ep(\d+)-ba(\d+)", fn)
-        if m:
-            return tuple(map(int, m.groups()))
-        return (-1, -1)
+    # Filter files in the specified file_path that end with .pt or .yaml
+    valid_files = [file for file in repo_files if file.startswith(file_path) and file.endswith((".pt", ".yaml"))]
 
-    return max(valid, key=extract_nums, default=None)
+    if len(valid_files) == 1:
+        return valid_files[0]
+
+    # Function to extract epoch and batch numbers from the filename
+    def extract_numbers(filename: str):
+        match = re.search(r"ep(\d+)-ba(\d+)", filename)
+        if match:
+            epoch, batch = map(int, match.groups())
+            return epoch, batch
+        return -1, -1  # Return a default value for files that don't match the pattern
+
+    # Find the newest file based on epoch and batch numbers
+    newest_file = max(valid_files, key=extract_numbers, default=None)
+
+    return newest_file
 
 
 def download_hub_files(
@@ -502,29 +567,41 @@ def download_hub_files(
     repo_type: str = "model",
     token: Optional[str] = None,
 ) -> List[Path]:
+    """Download specific files or the entire repository from a Hugging Face Hub repository."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    downloaded_files: List[Path] = []
+    downloaded_files = []
 
     def move_and_flatten_files(local_dir: Path):
-        for fp in local_dir.rglob("*"):
-            if fp.is_file() and fp.name.endswith((".pt", ".yaml")):
-                target_dir = output_dir / fp.parent.name
-                if fp.parent.resolve() in [target_dir.resolve(), output_dir.resolve()]:
-                    downloaded_files.append(fp)
+        for file_path in local_dir.rglob("*"):
+            if file_path.is_file() and file_path.name.endswith((".pt", ".yaml")):
+                # Determine the target directory
+                target_dir = output_dir / file_path.parent.name
+
+                # Check if the file is already in the correct location
+                if file_path.parent.resolve() in [target_dir.resolve(), output_dir.resolve()]:
+                    downloaded_files.append(file_path)
                     continue
+
+                # Create the target directory if it doesn't exist
                 target_dir.mkdir(parents=True, exist_ok=True)
-                new_path = target_dir / fp.name
-                fp.rename(new_path)
+                # Move the file to the target directory
+                new_path = target_dir / file_path.name
+                file_path.rename(new_path)
                 downloaded_files.append(new_path)
 
+    # List all files in the repository
     api = HfApi()
     repo_files = api.list_repo_files(repo_id=repo_id, repo_type=repo_type, token=token)
+
     try:
         if not filenames:
+            # Check if files already exist before downloading entire repository
             existing_files = list(output_dir.glob("**/*.pt")) + list(output_dir.glob("**/*.yaml"))
             if existing_files:
-                print(f"Found existing files in '{output_dir}', skipping snapshot_download.")
+                print(f"Found existing files in '{output_dir}', skipping download.")
                 return existing_files
+
+            # Download the entire repository
             local_dir = snapshot_download(
                 repo_id=repo_id,
                 repo_type=repo_type,
@@ -534,22 +611,25 @@ def download_hub_files(
                 use_auth_token=token,
             )
             move_and_flatten_files(Path(local_dir))
-            print(f"Successfully downloaded entire repo '{repo_id}' -> '{output_dir}'.")
+            print(f"Successfully downloaded and flattened the repository '{repo_id}' to '{output_dir}'.")
         else:
-            for fn in filenames:
-                resolved_filename = find_checkpoint_file(fn, repo_files)
+            for filename in filenames:
+                resolved_filename = find_checkpoint_file(filename, repo_files)
                 if not resolved_filename:
-                    print(f"Warning: No match for '{fn}' in {repo_id}.")
+                    print(f"Warning: Could not find matching file for '{filename}' in repository.")
                     continue
-                just_name = Path(resolved_filename).name
+
+                # Check if file exists in output_dir or any immediate subdirectory
+                filename = Path(resolved_filename).name
                 parent_dir = Path(resolved_filename).parent.name
-                existing_fs = list(output_dir.glob(f"**/{parent_dir}/{just_name}"))
-                if existing_fs:
-                    existing_file = existing_fs[0]
-                    print(f"File '{parent_dir}/{just_name}' already exists at '{existing_file}', skip download.")
+                existing_files = list(output_dir.glob(f"**/{parent_dir}/{filename}"))
+                if existing_files:
+                    existing_file = existing_files[0]
+                    print(f"File '{parent_dir}/{filename}' already exists at '{existing_file}', skipping download.")
                     downloaded_files.append(existing_file)
                     continue
 
+                # Download the file
                 _ = hf_hub_download(
                     repo_id=repo_id,
                     filename=resolved_filename,
@@ -558,7 +638,7 @@ def download_hub_files(
                     local_dir=output_dir,
                     cache_dir=None,
                 )
-                print(f"Downloaded '{resolved_filename}' from '{repo_id}'.")
+                print(f"Successfully downloaded '{resolved_filename}' from '{repo_id}'.")
             move_and_flatten_files(output_dir)
     except Exception as e:
         print(f"Error downloading from '{repo_id}': {e}")
@@ -632,11 +712,12 @@ def _main(
 
     if not skip_generation:
         print("\nGenerating evaluation configs...\n")
+
         if not run_all_yamls:
             config_files_completed = list(checkpoints.glob("*_evaluation.yaml"))
-            print("Skipping Completed Jobs (delete yamls to re-run):")
-            for c in config_files_completed:
-                print(f"   {c.name}\n")
+            print("Skipping Completed Jobs (delete yamls to run):")
+            for config in config_files_completed:
+                print(f"   {config.name}\n")
         else:
             config_files_completed = []
 
@@ -667,9 +748,10 @@ def _main(
         config_files = list(checkpoints.glob("*_evaluation.yaml"))
 
     print("Jobs to be run:")
-    for cfg in config_files:
-        print(f"   {cfg.name}\n")
+    for config in config_files:
+        print(f"   {config.name}\n")
 
+    # Wait for the dataset download to complete
     print("Waiting for dataset downloads to complete...")
     download_process.join()
     print("\nDataset downloading complete.")
@@ -685,11 +767,12 @@ def _main(
             console.print(f"[bold green]Running {config_files[0].name} in parallel on GPUs: {gpu_ids}")
         run_job(config_files[0], verbose=verbose, delete_eval_yamls=delete_eval_yamls, gpu_ids=gpu_ids)
     else:
-        msg = "No evaluation config (.yaml) files found."
+        message = "No configuration files found in the specified directory."
         if verbose:
-            print(msg)
+            print(message)
         else:
-            console.print(f"[bold red]{msg}")
+            console.print(f"[bold red]{message}")
+
         raise Exit(code=1)
 
     if verbose:
@@ -723,7 +806,7 @@ def main(
     seeds: Annotated[List[int], Option("--seeds")] = [1618, 42, 6033, 3145],
     verbose: Annotated[bool, Option("-v", "--verbose")] = False,
     overwrite_existing_symlinks: Annotated[bool, Option("--override-existing-symlinks")] = False,
-    parallel: Annotated[bool, Option("--parallel/--single")] = False,
+    parallel: Annotated[bool, Option("--parallel")] = False,
     delete_eval_yamls: Annotated[bool, Option("--delete/--keep")] = False,
     use_dir_names: Annotated[Optional[bool], Option("--use-dir-names")] = None,
     gpu_ids: Annotated[Optional[List[int]], Option("--gpu-ids")] = None,
@@ -768,11 +851,12 @@ if __name__ == "__main__":
     try:
         app()
     finally:
-        for p in all_processes:
-            if p.poll() is None:
-                p.terminate()
-        for p in all_processes:
+        # Ensure all subprocesses are terminated when the script exits
+        for process in all_processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in all_processes:
             try:
-                p.wait(timeout=5)
+                process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                p.kill()
+                process.kill()
