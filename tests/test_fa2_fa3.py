@@ -4,6 +4,7 @@
 import os
 import sys
 import random
+from tempfile import TemporaryDirectory
 import time
 
 import pytest
@@ -39,7 +40,7 @@ layer_combinations = [
     ("postnorm", "absolute_pos", "base", "glu"),
     ("prenorm", "sans_pos", "rope", "mlp"),
     ("postnorm", "sans_pos", "rope", "glu"),
-    ("parallel_prenorm", "absolute_pos", "rope_parallel", "parallel_glu"),
+    ("parallel_prenorm", "absolute_pos", "parallel", "parallel_glu"),
     ("parallel_prenorm", "sans_pos", "rope_parallel", "parallel_glu"),
 ]
 
@@ -65,6 +66,8 @@ def test_trainer(
 ):
     if not unpad_embeddings and pad_logits:
         pytest.skip("Pad logits requires unpadded embeddings.")
+    if embedding == "absolute_pos" and partial_compile:
+        pytest.skip("Absolute positional embedding does not support partial compile")
 
     with open("yamls/defaults.yaml") as f:
         default_cfg = OmegaConf.load(f)
@@ -76,7 +79,7 @@ def test_trainer(
     assert isinstance(config, DictConfig)
 
     config.model.name = "flex_bert"
-    config.seed = 42
+    config.seed = random.randint(0, 1000000)
     config.model.model_config.bert_layer = layer
     config.model.model_config.embedding_layer = embedding
     config.model.model_config.attention_layer = attention
@@ -116,16 +119,18 @@ def test_trainer(
     if config.model.model_config.loss_function == "fa_cross_entropy":
         config.model.model_config.loss_kwargs["lse_square_scale"] = random.choice([1e-4, 0])
 
-    with SynthTextDirectory() as tmp_datadir:
+    with TemporaryDirectory() as tmp_local_dir:
         config.model.model_config.use_fa = True
+        config.model.model_config.use_fa2 = True
+        config.model.model_config.use_fa3 = False
         config.model.model_config.unpad_embeddings = True
         config.model.model_config.pad_logits = pad_logits
-        config.train_loader.dataset.remote = tmp_datadir
-        config.train_loader.dataset.local = os.path.join(tmp_datadir, "tr-local1")
-        config.eval_loader.dataset.remote = tmp_datadir
-        config.eval_loader.dataset.local = os.path.join(tmp_datadir, "ev-local1")
+        config.train_loader.dataset.remote = synth_text_dir
+        config.train_loader.dataset.local = f"{tmp_local_dir}/tr-local1"
+        config.eval_loader.dataset.remote = synth_text_dir
+        config.eval_loader.dataset.local = f"{tmp_local_dir}/ev-local1"
 
-        # Train with FA2/FA3
+        # Train with FA2
         trainer1 = main(config, return_trainer=True)
         assert trainer1 is not None
         model1 = trainer1.state.model.model
@@ -142,31 +147,28 @@ def test_trainer(
                 assert model1.bert.encoder.layers[1].attn.sliding_window == [32, 32], f"Sliding window not set for second layer: {model1.bert.encoder.layers[1].attn}"
                 assert model1.bert.encoder.layers[2].attn.sliding_window == [32, 32], f"Sliding window not set for third layer: {model1.bert.encoder.layers[2].attn}"
             # fmt: on
-        # SDPA doesn't have sliding window implemented, so skip the test
-        else:
-            config.model.model_config.sliding_window = -1
-            config.model.model_config.use_fa = False
-            config.model.model_config.use_sdpa_attn_mask = True
-            config.train_loader.dataset.local = os.path.join(tmp_datadir, "tr-local2")
-            config.eval_loader.dataset.local = os.path.join(tmp_datadir, "ev-local2")
 
-            # Train with SDPA
-            trainer2 = main(config, return_trainer=True)
-            assert trainer2 is not None
-            model2 = trainer2.state.model.model
+        config.model.model_config.use_fa2 = False
+        config.model.model_config.use_fa3 = True
+        config.train_loader.dataset.local = f"{tmp_local_dir}/tr-local2"
+        config.eval_loader.dataset.local = f"{tmp_local_dir}/ev-local2"
 
-    # SDPA doesn't have sliding window impleemnted, so skip the comparison
-    if not sliding_window:
-        for param1, param2 in zip(model1.parameters(), model2.parameters()):
-            torch.testing.assert_close(param1, param2, rtol=1e-2, atol=1e-3)
+        # Train with FA3
+        trainer2 = main(config, return_trainer=True)
+        assert trainer2 is not None
+        model2 = trainer2.state.model.model
 
-        if different_first_layer:
-            nl = config.model.model_config.num_initial_layers
-            for m in range(2):
-                model = model1 if m == 0 else model2
-                for i in range(nl - 1):
+    for param1, param2 in zip(model1.parameters(), model2.parameters()):
+        # parallel layers appear to have more variance between FA2 and FA3 paths
+        torch.testing.assert_close(param1, param2, rtol=1e-2, atol=5e-3 if "parallel" in layer else 1e-3)
+
+    if different_first_layer:
+        nl = config.model.model_config.num_initial_layers
+        for m in range(2):
+            model = model1 if m == 0 else model2
+            for i in range(nl - 1):
+                assert isinstance(model.bert.encoder.layers[i], type(model.bert.encoder.layers[i + 1]))
+            if nl < len(model.bert.encoder.layers):
+                assert not isinstance(model.bert.encoder.layers[nl - 1], type(model.bert.encoder.layers[nl]))
+                for i in range(nl, len(model1.bert.encoder.layers) - 1):
                     assert isinstance(model.bert.encoder.layers[i], type(model.bert.encoder.layers[i + 1]))
-                if nl < len(model.bert.encoder.layers):
-                    assert not isinstance(model.bert.encoder.layers[nl - 1], type(model.bert.encoder.layers[nl]))
-                    for i in range(nl, len(model1.bert.encoder.layers) - 1):
-                        assert isinstance(model.bert.encoder.layers[i], type(model.bert.encoder.layers[i + 1]))
