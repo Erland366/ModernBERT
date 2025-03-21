@@ -203,7 +203,7 @@ class StreamingTextDataset(StreamingDataset):
 
     # How to tokenize a text sample to a token sample
     def _tokenize(self, text_sample):
-        if self.tokenizer._pad_token is None:
+        if self.tokenizer.pad_token_id is None:
             # Some tokenizers (e.g. GPT2 tokenizer) have no padding token which causes bugs
             raise RuntimeError("If tokenizing on-the-fly, tokenizer must have a pad_token_id")
 
