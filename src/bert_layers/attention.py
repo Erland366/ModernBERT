@@ -311,12 +311,13 @@ class FlexBertAttention(FlexBertAttentionBase):
         else:
             self.sliding_window = [config.sliding_window // 2, config.sliding_window // 2]
 
-        use_fa3 = True
         if config.fa2_local_attn and self.sliding_window != [-1, -1]:
-            use_fa3 = False
+            use_fa3_local_attn = False
+        else:
+            use_fa3_local_attn = True
 
-        self.use_fa2 = config.use_fa and IMPL_USE_FLASH2
-        self.use_fa3 = config.use_fa and IMPL_USE_FLASH3 and use_fa3
+        self.use_fa2 = config.use_fa and config.use_fa2 and IMPL_USE_FLASH2
+        self.use_fa3 = config.use_fa and config.use_fa3 and IMPL_USE_FLASH3 and use_fa3_local_attn
 
         # Warn if defaulting to pytorch because of import issues
         if config.use_fa and not self.use_fa2 and not self.use_fa3:
@@ -424,7 +425,6 @@ class FlexBertAttention(FlexBertAttentionBase):
                     deterministic=self.deterministic_fa2,
                     window_size=self.sliding_window,
                 )
-            attn = attn.view(1, total_seq, dim)
         elif self.use_fa2:
             qkv = qkv.view(total_seq, 3, self.num_attention_heads, self.attn_head_size)
 
@@ -453,7 +453,6 @@ class FlexBertAttention(FlexBertAttentionBase):
                     deterministic=self.deterministic_fa2,
                     window_size=self.sliding_window,
                 )
-            attn = attn.view(1, total_seq, dim)
         else:
             qkv = bert_padding.pad_input(qkv.squeeze(0), indices, cu_seqlens.shape[0] - 1, max_seqlen)
             unpad_bs, seqlen, _ = qkv.shape
@@ -514,12 +513,13 @@ class FlexBertParallelAttention(FlexBertAttentionBase):
         else:
             self.sliding_window = [config.sliding_window // 2, config.sliding_window // 2]
 
-        use_fa3 = True
         if config.fa2_local_attn and self.sliding_window != [-1, -1]:
-            use_fa3 = False
+            use_fa3_local_attn = False
+        else:
+            use_fa3_local_attn = True
 
-        self.use_fa2 = config.use_fa and IMPL_USE_FLASH2
-        self.use_fa3 = config.use_fa and IMPL_USE_FLASH3 and use_fa3
+        self.use_fa2 = config.use_fa and config.use_fa2 and IMPL_USE_FLASH2
+        self.use_fa3 = config.use_fa and config.use_fa3 and IMPL_USE_FLASH3 and use_fa3_local_attn
 
         # Warn if defaulting to pytorch because of import issues
         if config.use_fa and not self.use_fa2 and not self.use_fa3:
@@ -621,7 +621,6 @@ class FlexBertParallelAttention(FlexBertAttentionBase):
                     deterministic=self.deterministic_fa2,
                     window_size=self.sliding_window,
                 )
-            attn = attn.view(1, total_seq, dim)
         elif self.use_fa2:
             qkv = qkv.view(total_seq, 3, self.num_attention_heads, self.attn_head_size)
 
@@ -650,7 +649,6 @@ class FlexBertParallelAttention(FlexBertAttentionBase):
                     deterministic=self.deterministic_fa2,
                     window_size=self.sliding_window,
                 )
-            attn = attn.view(1, total_seq, dim)
         else:
             qkv = bert_padding.pad_input(qkv.squeeze(0), indices, cu_seqlens.shape[0] - 1, max_seqlen)
             unpad_bs, seqlen, _ = qkv.shape
@@ -713,7 +711,6 @@ class FlexBertRopeAttention(FlexBertAttentionBase):
         if config.rotary_emb_dim is None:
             config.rotary_emb_dim = self.attn_head_size
 
-        use_fa3 = True
         rotary_base = config.rotary_emb_base
         rotary_dim = config.rotary_emb_dim
         if self.sliding_window != [-1, -1]:
@@ -721,8 +718,6 @@ class FlexBertRopeAttention(FlexBertAttentionBase):
                 rotary_base = config.local_attn_rotary_emb_base
             if config.local_attn_rotary_emb_dim is not None:
                 rotary_dim = config.local_attn_rotary_emb_dim
-            if config.fa2_local_attn:
-                use_fa3 = False
 
         assert UnpaddedRotaryEmbedding is not None, "rotary_emb is not installed"
         if "no_compile" in config.attention_layer:
@@ -736,8 +731,13 @@ class FlexBertRopeAttention(FlexBertAttentionBase):
             max_seqlen=config.max_position_embeddings * config.rope_microbatch_size,
         )
 
-        self.use_fa2 = config.use_fa and IMPL_USE_FLASH2
-        self.use_fa3 = config.use_fa and IMPL_USE_FLASH3 and use_fa3
+        if config.fa2_local_attn and self.sliding_window != [-1, -1]:
+            use_fa3_local_attn = False
+        else:
+            use_fa3_local_attn = True
+
+        self.use_fa2 = config.use_fa and config.use_fa2 and IMPL_USE_FLASH2
+        self.use_fa3 = config.use_fa and config.use_fa3 and IMPL_USE_FLASH3 and use_fa3_local_attn
         self.deterministic_fa2 = config.deterministic_fa2
         self.use_sdpa_attn_mask = config.use_sdpa_attn_mask
 
@@ -852,7 +852,6 @@ class FlexBertRopeAttention(FlexBertAttentionBase):
                     deterministic=self.deterministic_fa2,
                     window_size=self.sliding_window,
                 )
-            attn = attn.view(1, total_seq, dim)
         elif self.use_fa2:
             convert_dtype = qkv.dtype not in (torch.float16, torch.bfloat16)
             if convert_dtype:
@@ -879,7 +878,6 @@ class FlexBertRopeAttention(FlexBertAttentionBase):
                     deterministic=self.deterministic_fa2,
                     window_size=self.sliding_window,
                 )
-            attn = attn.view(1, total_seq, dim)
         else:
             qkv = bert_padding.pad_input(qkv.squeeze(0), indices, cu_seqlens.shape[0] - 1, max_seqlen)
             unpad_bs, seqlen, *_ = qkv.shape
@@ -940,7 +938,6 @@ class FlexBertRopeParallelAttention(FlexBertAttentionBase):
         if config.rotary_emb_dim is None:
             config.rotary_emb_dim = self.attn_head_size
 
-        use_fa3 = True
         rotary_base = config.rotary_emb_base
         rotary_dim = config.rotary_emb_dim
         if self.sliding_window != [-1, -1]:
@@ -948,8 +945,6 @@ class FlexBertRopeParallelAttention(FlexBertAttentionBase):
                 rotary_base = config.local_attn_rotary_emb_base
             if config.local_attn_rotary_emb_dim is not None:
                 rotary_dim = config.local_attn_rotary_emb_dim
-            if config.fa2_local_attn:
-                use_fa3 = False
 
         assert UnpaddedRotaryEmbedding is not None, "rotary_emb is not installed"
         if "no_compile" in config.attention_layer:
@@ -962,8 +957,13 @@ class FlexBertRopeParallelAttention(FlexBertAttentionBase):
             scale_base=config.rotary_emb_scale_base,  # If scale_base is not None, this implements XPos (Sun et al., https://arxiv.org/abs/2212.10554).
         )
 
-        self.use_fa2 = config.use_fa and IMPL_USE_FLASH2
-        self.use_fa3 = config.use_fa and IMPL_USE_FLASH3 and use_fa3
+        if config.fa2_local_attn and self.sliding_window != [-1, -1]:
+            use_fa3_local_attn = False
+        else:
+            use_fa3_local_attn = True
+
+        self.use_fa2 = config.use_fa and config.use_fa2 and IMPL_USE_FLASH2
+        self.use_fa3 = config.use_fa and config.use_fa3 and IMPL_USE_FLASH3 and use_fa3_local_attn
         self.deterministic_fa2 = config.deterministic_fa2
         self.use_sdpa_attn_mask = config.use_sdpa_attn_mask
 
@@ -1071,7 +1071,6 @@ class FlexBertRopeParallelAttention(FlexBertAttentionBase):
                     deterministic=self.deterministic_fa2,
                     window_size=self.sliding_window,
                 )
-            attn = attn.view(1, total_seq, dim)
         elif self.use_fa2:
             convert_dtype = qkv.dtype not in (torch.float16, torch.bfloat16)
             if convert_dtype:
@@ -1098,7 +1097,6 @@ class FlexBertRopeParallelAttention(FlexBertAttentionBase):
                     deterministic=self.deterministic_fa2,
                     window_size=self.sliding_window,
                 )
-            attn = attn.view(1, total_seq, dim)
         else:
             qkv = bert_padding.pad_input(qkv.squeeze(0), indices, cu_seqlens.shape[0] - 1, attn_mask.shape[-1])
             unpad_bs, seqlen, *_ = qkv.shape

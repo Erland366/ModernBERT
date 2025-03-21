@@ -4,6 +4,7 @@
 # Copyright 2022 MosaicML Examples authors
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
 import warnings
 
 from transformers import BertConfig as TransformersBertConfig
@@ -79,6 +80,8 @@ class FlexBertConfig(TransformersBertConfig):
         rotary_emb_scale_base=None,
         rotary_emb_interleaved: bool = False,
         use_fa: bool = True,
+        use_fa2: Optional[bool] = None,
+        use_fa3: Optional[bool] = None,
         use_sdpa_attn_mask: bool = False,
         allow_embedding_resizing: bool = False,
         init_method: str = "default",
@@ -140,6 +143,8 @@ class FlexBertConfig(TransformersBertConfig):
             rotary_emb_scale_base (float): Rotary embedding scale base.
             rotary_emb_interleaved (bool): Use interleaved rotary embeddings.
             use_fa (bool): Use Flash Attention 2 or Flash Attention 3. Requires flash_attn package.
+            use_fa2 (bool | None): Set this and `use_fa3` to specify whether to use Flash Attention 2 or 3. Requires flash_attn package.
+            use_fa3 (bool | None): Set this and `use_fa2` to specify whether to use Flash Attention 2 or 3. Requires building FA3 from source.
             use_sdpa_attn_mask (bool): Pass a mask to SDPA. This will prevent SDPA from using the PyTorch FA2 kernel.
             allow_embedding_resizing (bool): Embeddings will be automatically resized when they are smaller than the tokenizer vocab size.
             init_method (str): Model layers initialization method.
@@ -199,6 +204,8 @@ class FlexBertConfig(TransformersBertConfig):
         self.rotary_emb_scale_base = rotary_emb_scale_base
         self.rotary_emb_interleaved = rotary_emb_interleaved
         self.use_fa = use_fa
+        self.use_fa2 = use_fa if use_fa2 is None else use_fa2
+        self.use_fa3 = use_fa if use_fa3 is None else use_fa3
         self.use_sdpa_attn_mask = use_sdpa_attn_mask
         self.allow_embedding_resizing = allow_embedding_resizing
         self.init_method = init_method
@@ -266,3 +273,8 @@ class FlexBertConfig(TransformersBertConfig):
 
         if self.rope_microbatch_size < 1:
             raise ValueError(f"{self.rope_microbatch_size=} must be greater than 0")
+
+        if (self.use_fa2 and not self.use_fa) or (self.use_fa3 and not self.use_fa):
+            raise ValueError(
+                f"One of {self.use_fa2=} or {self.use_fa3=} is true but {self.use_fa=} is false. Set `use_fa` to True to use Flash Attention 2 or 3."
+            )
