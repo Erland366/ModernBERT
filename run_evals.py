@@ -13,7 +13,7 @@ from collections import deque
 from enum import Enum
 from multiprocessing import Process, Queue
 from pathlib import Path
-from typing import Annotated, List, Optional, Union
+from typing import Annotated, List, Optional
 
 import datasets
 import psutil
@@ -43,6 +43,7 @@ class ModelSize(str, Enum):
     LARGE = "large"
     HUGE = "huge"
 
+
 # from maxb2: https://github.com/tiangolo/typer/issues/86#issuecomment-996374166
 def conf_callback(ctx: typer.Context, param: typer.CallbackParam, config: Optional[str] = None):
     if config is not None:
@@ -69,6 +70,7 @@ all_processes = []
 allowed_gpus = None  # Will be set to list of GPU IDs or None
 
 console = Console()
+
 
 def kill_process_tree(pid: int):
     try:
@@ -339,7 +341,7 @@ def create_symlink_for_newest_checkpoint(folder: Path, override_existing: bool =
             return
 
         if len(pt_files) == 1 and pt_files[0].name == "latest-rank0.pt" and not pt_files[0].is_symlink():
-            print(f"   Only found one .pt in {folder.name}, named 'latest-rank0.pt' (real file). Skipping symlink creation.")
+            print(f"   Only found one .pt in {folder.name}, named 'latest-rank0.pt' (real file). Skipping symlink creation.")  # fmt: skip
             return
 
         # Sort files based on epoch and batch numbers extracted from filenames
@@ -401,7 +403,7 @@ def generate_eval_configs(
     head_class_act: Optional[str],
     head_class_norm: Optional[str],
     head_class_dropout: float,
-    tasks: Optional[List[Union[TaskName, str]]],  # type: ignore
+    tasks: Optional[List[TaskName]],  # type: ignore
     fast_ultrafeedback: bool,
     seeds: List[int],
     parallel: bool,
@@ -481,8 +483,10 @@ def generate_eval_configs(
             cmd.append("--parallel")
 
         if gpu_ids:
-            if isinstance(gpu_ids, int): gpu_ids = [gpu_ids]
-            for g in gpu_ids: cmd.extend(["--gpu-ids", str(g)])
+            if isinstance(gpu_ids, int):
+                gpu_ids = [gpu_ids]
+            for g in gpu_ids:
+                cmd.extend(["--gpu-ids", str(g)])
 
         # Run the config generation process without suppressing output
 
@@ -499,7 +503,7 @@ def download_dataset(dataset_name: str, subset: Optional[str] = None):
         return f"Error in processing {dataset_name}: {e}"
 
 
-def download_datasets(tasks: List[Union[TaskName, str]], msg_queue):  # type: ignore
+def download_datasets(tasks: List[TaskName], msg_queue):  # type: ignore
     try:
         required_datasets = []
         task_to_datasets = {
@@ -508,19 +512,15 @@ def download_datasets(tasks: List[Union[TaskName, str]], msg_queue):  # type: ig
             "eurlex": [["coastalcph/lex_glue", "eurlex"]],
             "ultrafeedback": [["rbiswasfc/ultrafeedback-binary-classification"]],
         }
-        for t in tasks:
-            if hasattr(t, "value"):
-                task_val = t.value
-            else:
-                task_val = str(t)
 
-            if task_val in GLUE_TASKS:
-                required_datasets.append(["glue", task_val])
-            elif task_val in SUPERGLUE_TASKS:
-                required_datasets.append(["aps/super_glue", task_val])
+        for task in tasks:
+            if task.value in GLUE_TASKS:
+                datasets_info = [["glue", task.value]]
+            elif task.value in SUPERGLUE_TASKS:
+                datasets_info = [["aps/super_glue", task.value]]
             else:
-                extras = task_to_datasets.get(task_val, [])
-                required_datasets.extend(extras)
+                datasets_info = task_to_datasets.get(task.value, [])
+            required_datasets.extend(datasets_info)
 
         # Suppress output globally in this process
         import sys
@@ -646,36 +646,38 @@ def download_hub_files(
     return downloaded_files
 
 
-def _main(
-    checkpoints: Union[str, Path],
-    train_config: Optional[Union[str, Path]] = None,
-    model_size: ModelSize = ModelSize.BASE,
-    rope_theta: Optional[float] = None,
-    skip_generation: bool = False,
-    run_all_yamls: bool = False,
-    tasks: Optional[List[Union[str, TaskName]]] = None,
-    hub_repo: Optional[str] = None,
-    hub_files: Optional[List[str]] = None,
-    hub_token: Optional[str] = None,
-    wandb_run: Optional[str] = None,
-    wandb_project: Optional[str] = None,
-    wandb_entity: Optional[str] = None,
-    track_run: bool = False,
-    track_run_project: Optional[str] = None,
-    pooling_type: Optional[str] = None,
-    head_class_act: Optional[str] = None,
-    head_class_norm: Optional[str] = None,
-    head_class_dropout: float = 0.0,
-    fast_ultrafeedback: bool = False,
-    seeds: List[int] = [1618, 42, 6033, 3145],
-    verbose: bool = False,
-    overwrite_existing_symlinks: bool = False,
-    parallel: bool = False,
-    delete_eval_yamls: bool = False,
-    use_dir_names: Optional[bool] = None,
-    gpu_ids: Optional[List[int]] = None,
-    config: Optional[Union[str, Path]] = None,
-):
+@app.command()
+def main(
+    checkpoints: Annotated[Path, Option(help="Path to the directory containing FlexBert checkpoints or location to download checkpoints from Hugging Face Hub to", rich_help_panel="Checkpoint & Config Paths", show_default=False)],
+    train_config: Annotated[Optional[Path], Option(help="Path to a .yaml file containing training configuration. If one is not provided, will attempt to load the config from a wandb run or use defaults.", rich_help_panel="Checkpoint & Config Paths")] = None,
+    model_size: Annotated[ModelSize, Option("--model-size", help="Model to use for default model config", rich_help_panel="Checkpoint & Config Paths")] = ModelSize.BASE,
+    rope_theta: Annotated[Optional[float], Option("--rope-theta", help="Value for `rotary_emb_base` in the model configuration. If not provided, defaults to pretraining value of 10000.0", rich_help_panel="Checkpoint & Config Paths")] = None,
+    skip_generation: Annotated[bool, Option("--skip-generation", help="Skip generation of evaluation configs. If not true, assumes all existing eval yamls have been already ran.", rich_help_panel="Checkpoint & Config Paths")] = False,
+    run_all_yamls: Annotated[bool, Option("--run-all-yamls", help="Run all evaluation yamls in the `checkpoints` directory, even if some have already been run.", rich_help_panel="Checkpoint & Config Paths")] = False,
+    tasks: Annotated[Optional[List[TaskName]], Option(help="List of tasks to include in the evaluation. Default is all tasks.", rich_help_panel="Eval Tasks", case_sensitive=False, show_default=False)] = None, # type: ignore
+    hub_repo: Annotated[Optional[str], Option(help="Hugging Face Hub repository ID to download FlexBert weights. Downloads to `checkpoints` directory.", rich_help_panel="Hugging Face Download")] = None,
+    hub_files: Annotated[Optional[List[str]], Option(help="List of files to download from the `hub_repo`. If not provided, will download all files in the repo.", rich_help_panel="Hugging Face Download")] = None,
+    hub_token: Annotated[Optional[str], Option(help="Authentication token for private Hugging Face Hub repositories if not already logged in via `huggingface-cli login`", rich_help_panel="Hugging Face Download")] = None,
+    wandb_run: Annotated[Optional[str], Option(help="wandb run containing the training configuration", rich_help_panel="Weights & Biases")] = None,
+    wandb_project: Annotated[Optional[str], Option(help="wandb project for the run", rich_help_panel="Weights & Biases")] = None,
+    wandb_entity: Annotated[Optional[str], Option(help="wandb entity for the project", rich_help_panel="Weights & Biases")] = None,
+    track_run: Annotated[bool, Option("--track-run", help="Track the eval run with wandb", rich_help_panel="Weights & Biases")] = False,
+    track_run_project: Annotated[Optional[str], Option(help="wandb project for tracking the run", rich_help_panel="Weights & Biases")] = None,
+    pooling_type: Annotated[Optional[str], Option(help="Pooling type for the classification head", show_default=False, rich_help_panel="Model Options")] = None,
+    head_class_act: Annotated[Optional[str], Option(help="Classification head activation function", show_default=False, rich_help_panel="Model Options")] = None,
+    head_class_norm: Annotated[Optional[str], Option(help="Classification head normalization function", show_default=False, rich_help_panel="Model Options")] = None,
+    head_class_dropout: Annotated[float, Option(help="Classification head dropout rate", rich_help_panel="Model Options")] = 0.0,
+    fast_ultrafeedback: Annotated[bool, Option("--fast-ultrafeedback", help="Use a shorter sequence length (1536) for the UltraFeedback eval", rich_help_panel="Task Settings")] = False,
+    seeds: Annotated[List[int], Option(help="List of seeds to use for the eval", rich_help_panel="Task Settings")] = [1618, 42, 6033, 3145],
+    verbose: Annotated[bool, Option("-v", "--verbose", help="Show detailed output from evaluation jobs", rich_help_panel="Config Options")] = False,
+    overwrite_existing_symlinks: Annotated[bool, Option("--override-existing-symlinks", help="Overwrite existing symlinks to point to latest checkpoint", rich_help_panel="Config Options")] = False,
+    parallel: Annotated[bool, Option("--parallel/--single", help="Run the evals in parallel on multiple GPUs or one GPU. Use `parallel` if passing to `config`. Only use if evaluating a single checkpoint on multiple GPUs.", rich_help_panel="Task Settings")] = False,
+    delete_eval_yamls: Annotated[bool, Option("--delete/--keep", help="Delete all evaluation YAML files after running the evals. Use `delete_eval_yamls` if passing to `config`", rich_help_panel="Config Options")] = False,
+    use_dir_names: Annotated[Optional[bool], Option("--use-dir-names", help="Use the folder names as the wandb run names. Defaults to true if multiple `checkpoints` are provided with one `train_config`", rich_help_panel="Config Options")] = None,
+    gpu_ids: Annotated[Optional[List[int]], Option(help="List of GPU IDs to use", rich_help_panel="GPU Options")] = None,
+    config: Annotated[Optional[Path], Option(callback=conf_callback, is_eager=True, help="Relative path to YAML config file for setting options. Passing CLI options will supersede config options.", case_sensitive=False, rich_help_panel="Options")] = None,
+):  # fmt: skip
+    """Run evaluations on model checkpoints."""
     if isinstance(checkpoints, str):
         checkpoints = Path(checkpoints)
     if isinstance(train_config, str):
@@ -690,7 +692,7 @@ def _main(
             repo_id=hub_repo,
             filenames=hub_files,
             output_dir=checkpoints,
-            token=hub_token
+            token=hub_token,
         )
         if not downloaded_files:
             print("No files were downloaded successfully. Exiting.")
@@ -781,69 +783,7 @@ def _main(
         console.print("[bold green]All jobs completed.")
 
 
-@app.command()
-def main(
-    checkpoints: Annotated[Path, Option("--checkpoints", help="Directory for model checkpoints.")],
-    train_config: Annotated[Optional[Path], Option(help="Path to .yaml config")] = None,
-    model_size: Annotated[ModelSize, Option("--model-size")] = ModelSize.BASE,
-    rope_theta: Annotated[Optional[float], Option("--rope-theta")] = None,
-    skip_generation: Annotated[bool, Option("--skip-generation")] = False,
-    run_all_yamls: Annotated[bool, Option("--run-all-yamls")] = False,
-    tasks: Annotated[Optional[List[TaskName]], Option(help="Tasks")] = None,
-    hub_repo: Annotated[Optional[str], Option("--hub-repo")] = None,
-    hub_files: Annotated[Optional[List[str]], Option("--hub-files")] = None,
-    hub_token: Annotated[Optional[str], Option("--hub-token")] = None,
-    wandb_run: Annotated[Optional[str], Option("--wandb-run")] = None,
-    wandb_project: Annotated[Optional[str], Option("--wandb-project")] = None,
-    wandb_entity: Annotated[Optional[str], Option("--wandb-entity")] = None,
-    track_run: Annotated[bool, Option("--track-run")] = False,
-    track_run_project: Annotated[Optional[str], Option("--track-run-project")] = None,
-    pooling_type: Annotated[Optional[str], Option("--pooling-type")] = None,
-    head_class_act: Annotated[Optional[str], Option("--head-class-act")] = None,
-    head_class_norm: Annotated[Optional[str], Option("--head-class-norm")] = None,
-    head_class_dropout: Annotated[float, Option("--head-class-dropout")] = 0.0,
-    fast_ultrafeedback: Annotated[bool, Option("--fast-ultrafeedback")] = False,
-    seeds: Annotated[List[int], Option("--seeds")] = [1618, 42, 6033, 3145],
-    verbose: Annotated[bool, Option("-v", "--verbose")] = False,
-    overwrite_existing_symlinks: Annotated[bool, Option("--override-existing-symlinks")] = False,
-    parallel: Annotated[bool, Option("--parallel")] = False,
-    delete_eval_yamls: Annotated[bool, Option("--delete/--keep")] = False,
-    use_dir_names: Annotated[Optional[bool], Option("--use-dir-names")] = None,
-    gpu_ids: Annotated[Optional[List[int]], Option("--gpu-ids")] = None,
-    config: Annotated[Optional[Path], Option(callback=conf_callback, is_eager=True, help="YAML config file")] = None,
-):
-    _main(
-        checkpoints=checkpoints,
-        train_config=train_config,
-        model_size=model_size,
-        rope_theta=rope_theta,
-        skip_generation=skip_generation,
-        run_all_yamls=run_all_yamls,
-        tasks=tasks,
-        hub_repo=hub_repo,
-        hub_files=hub_files,
-        hub_token=hub_token,
-        wandb_run=wandb_run,
-        wandb_project=wandb_project,
-        wandb_entity=wandb_entity,
-        track_run=track_run,
-        track_run_project=track_run_project,
-        pooling_type=pooling_type,
-        head_class_act=head_class_act,
-        head_class_norm=head_class_norm,
-        head_class_dropout=head_class_dropout,
-        fast_ultrafeedback=fast_ultrafeedback,
-        seeds=seeds,
-        verbose=verbose,
-        overwrite_existing_symlinks=overwrite_existing_symlinks,
-        parallel=parallel,
-        delete_eval_yamls=delete_eval_yamls,
-        use_dir_names=use_dir_names,
-        gpu_ids=gpu_ids,
-        config=config,
-    )
-
-
+# Register the signal handler
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
