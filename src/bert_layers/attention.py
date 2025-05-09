@@ -1222,18 +1222,49 @@ class FlexBertUnpadRopeParallelSoftpickAttention(FlexBertAttentionBase):
         unpad_bs, seqlen, *_ = qkv.shape
 
         q, k, v = qkv.transpose(3, 1).unbind(dim=2)  # b h s d
-        breakpoint()
-        if self.use_parallel_softpick:
+        if True:
+            q = rearrange(q, "b h s d -> b s h d")
+            k = rearrange(k, "b h s d -> b s h d")
+            v = rearrange(v, "b h s d -> b s h d")
+            actual_lengths = attn_mask.sum(dim=-1).to(torch.long)
+            cu_seqlens = torch.cat([torch.tensor([0], device=q.device, dtype=torch.long),
+                                    torch.cumsum(actual_lengths, dim=0)])
+            q = [q[i, :actual_lengths[i].item(), ...] for i in range(unpad_bs)]
+            k = [k[i, :actual_lengths[i].item(), ...] for i in range(unpad_bs)]
+            v = [v[i, :actual_lengths[i].item(), ...] for i in range(unpad_bs)]
+
+            q = torch.cat(q, dim=0).unsqueeze(0) 
+            k = torch.cat(k, dim=0).unsqueeze(0) 
+            v = torch.cat(v, dim=0).unsqueeze(0) 
             logger.warn_once(
                 "Ussing parallel softpick attention assume we are using causal masking! Write new kernel dude"
             )
-            attn = parallel_softpick_attn(
+            o_parallel_packed = parallel_softpick_attn(
                 q,
                 k,
                 v,
                 scale=self.attn_head_size**-0.5,
-                head_first=True
+                cu_seqlens=cu_seqlens,
+                head_first=False
             )
+
+            attn = torch.zeros(unpad_bs, max_seqlen, self.num_attention_heads, self.attn_head_size, device=q.device)
+            current_pos = 0
+            for i in range(unpad_bs):  # Loop B times (for each sequence in the batch)
+                L_i = actual_lengths[i].item()  # Get the true length of the i-th sequence
+                if L_i > 0:
+                    # Source: Select the i-th sequence from the packed tensor
+                    # o_parallel_packed[0, current_pos:current_pos + L_i, ...]
+                    # This slice has shape (L_i, H, D_h)
+
+                    # Destination: Place it into the i-th slot of the padded tensor,
+                    #              up to its actual length L_i.
+                    # attn[i, :L_i, ...]
+                    # This slice also has shape (L_i, H, D_h)
+
+                    attn[i, :L_i, ...] = o_parallel_packed[0, current_pos:current_pos + L_i, ...]
+                current_pos += L_i # Move the starting point for the next sequence
+            attn = rearrange(attn, "b s h d -> b h s d")
         else:
             logger.warn_once(
                 "Using naive softpick attention. This is not recommended for production use."
@@ -1453,6 +1484,7 @@ class FlexBertPaddedRopeParallelSoftpickAttention(FlexBertAttentionBase):
         self.out_drop = (
             nn.Dropout(config.attn_out_dropout_prob) if config.attn_out_dropout_prob > 0.0 else nn.Identity()
         )
+        self.use_parallel_softpick = config.use_parallel_softpick if hasattr(config, "use_parallel_softpick") else False
 
         self.use_fa2 = config.use_fa2
         self.deterministic_fa2 = config.deterministic_fa2
@@ -1536,7 +1568,41 @@ class FlexBertPaddedRopeParallelSoftpickAttention(FlexBertAttentionBase):
         qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset, max_seqlen=None)
 
         q, k, v = qkv.transpose(3, 1).unbind(dim=2)  # b h s d
+        breakpoint()
         if self.use_parallel_softpick:
+            q = rearrange(q, "b h s d -> b s h d")
+            k = rearrange(q, "b h s d -> b s h d")
+            v = rearrange(q, "b h s d -> b s h d")
+            actual_lengths = attn_mask.sum(dim=-1).to(torch.long)
+            cu_seqlens = torch.cat([torch.tensor([0], device=q.device, dtype=torch.long),
+                                    torch.cumsum(actual_lengths, dim=0)])
+            q = [q[i, :actual_lengths[i].item(), ...] for i in range(bs)]
+            k = [k[i, :actual_lengths[i].item(), ...] for i in range(bs)]
+            v = [v[i, :actual_lengths[i].item(), ...] for i in range(bs)]
+
+            q = torch.cat(q, dim=0).unsqueeze(0) 
+            k = torch.cat(k, dim=0).unsqueeze(0) 
+            v = torch.cat(v, dim=0).unsqueeze(0) 
+            logger.warn_once(
+                "Using parallel softpick attention assume we are using causal masking! Write new kernel dude"
+            )
+            o_parallel_packed = parallel_softpick_attn(
+                q,
+                k,
+                v,
+                scale=self.attn_head_size**-0.5,
+                cu_seqlens=cu_seqlens,
+                head_first=False
+            )
+
+            attn = torch.zeros(bs, max_seqlen, self.num_attention_heads, self.attn_head_size)
+            current_pos = 0
+            for i in range(bs):
+                L_i = actual_lengths[i].item()
+                if L_i > 0:
+                    attn[i, :L_i, ...] = o_parallel_packed[0, current_pos:current_pos + L_i, ...]
+                current_pos += L_i
+            attn = rearrange(attn, "b s h d -> b h s d")
             attn = parallel_softpick_attn(
                 q,
                 k,

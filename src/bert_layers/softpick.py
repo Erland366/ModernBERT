@@ -697,10 +697,10 @@ def naive_softpick_attn(
     q_len = q.shape[-2]
     k_len = k.shape[-2]
     if mask is None:
-        mask = torch.tril(torch.ones(k_len, k_len, device=q.device))
+        mask = torch.ones(k_len, k_len, device=q.device)
     wei = torch.matmul(q, k.transpose(2, 3)) # shape: (batch_size, num_heads, q_len, k_len)
     wei = wei * scale
-    # wei = wei.masked_fill(mask[k_len-q_len:k_len, :k_len] == 0, float('-inf'))
+    wei = wei.masked_fill(mask[k_len-q_len:k_len, :k_len] == 0, float('-inf'))
     wei = softpick(wei.float(), dim=-1).to(q.dtype)
     o = torch.matmul(wei, v) # shape: (batch_size, num_heads, q_len, head_dim)
     if not head_first:
