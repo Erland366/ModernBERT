@@ -20,11 +20,13 @@ from typing import Optional
 import importlib.metadata
 import logging
 import math
+from einops import rearrange
 
 import bert_padding
 from .configuration_bert import FlexBertConfig, maybe_add_padding
 from .normalization import get_norm_layer
 from .initialization import ModuleType, init_weights
+from .softpick import parallel_softpick_attn, naive_softpick_attn
 import src.utils  # noqa: F401
 
 IMPL_USE_FLASH3 = False
@@ -1085,6 +1087,169 @@ class FlexBertPaddedRopeAttention(FlexBertAttentionBase):
         return self.out_drop(self.Wo(attn))
 
 
+class FlexBertUnpadRopeParallelSoftpickAttention(FlexBertAttentionBase):
+    """Performs multi-headed self attention on a batch of unpadded sequences.
+
+    If Flash Attention 2 is installed, this module uses Flash Attention to improve throughput.
+    If Flash Attention 2 is not installed, the implementation will use PyTorch's SDPA kernel,
+    which requires padding and unpadding inputs, adding some overhead.
+
+    See `forward` method for additional details.
+    """
+
+    def __init__(self, config: FlexBertConfig, layer_id: Optional[int] = None):
+        super().__init__(config=config, layer_id=layer_id)
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
+            raise ValueError(
+                f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
+                f"heads ({config.num_attention_heads})"
+            )
+
+        self.num_attention_heads = config.num_attention_heads
+        self.attn_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.hidden_size = config.hidden_size
+        self.p_dropout = config.attention_probs_dropout_prob
+        self.Wo = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attn_out_bias)
+        self.out_drop = (
+            nn.Dropout(config.attn_out_dropout_prob) if config.attn_out_dropout_prob > 0.0 else nn.Identity()
+        )
+
+        if config.global_attn_every_n_layers > 0:
+            if config.sliding_window == -1:
+                raise ValueError("global_attn_every_n_layers` requires `sliding_window` to be set")
+            if layer_id % config.global_attn_every_n_layers != 0:
+                self.sliding_window = (config.sliding_window // 2, config.sliding_window // 2)
+            else:
+                self.sliding_window = (-1, -1)
+        else:
+            self.sliding_window = (config.sliding_window // 2, config.sliding_window // 2)
+
+        if config.rotary_emb_dim is None:
+            config.rotary_emb_dim = self.attn_head_size
+
+        rotary_base = config.rotary_emb_base
+        rotary_dim = config.rotary_emb_dim
+        if self.sliding_window != (-1, -1):
+            if config.local_attn_rotary_emb_base != -1:
+                rotary_base = config.local_attn_rotary_emb_base
+            if config.local_attn_rotary_emb_dim is not None:
+                rotary_dim = config.local_attn_rotary_emb_dim
+
+        assert UnpaddedRotaryEmbedding is not None, "rotary_emb is not installed"
+        self.rotary_emb = UnpaddedRotaryEmbedding(
+            dim=rotary_dim,
+            base=rotary_base,
+            scale_base=config.rotary_emb_scale_base,  # If scale_base is not None, this implements XPos (Sun et al., https://arxiv.org/abs/2212.10554).
+            interleaved=config.rotary_emb_interleaved,
+        )
+
+        self.use_fa2 = config.use_fa2
+        self.deterministic_fa2 = config.deterministic_fa2
+        self.use_sdpa_attn_mask = config.use_sdpa_attn_mask
+        self.use_parallel_softpick = config.use_parallel_softpick if hasattr(config, "use_parallel_softpick") else False
+
+        # Warn if defaulting to pytorch because of import issues
+        if not IMPL_USE_FLASH2 and self.use_fa2:
+            logger.warn_once(
+                "Unable to import flash_attn; defaulting FlexBERT attention implementation to PyTorch's"
+                " SDPA kernel. This requires padding and unpadding inputs, which will add some overhead."
+            )
+            self.use_fa2 = False
+        if not self.use_fa2:
+            if not self.use_sdpa_attn_mask:
+                logger.warn_once(
+                    "SDPA attention is being used without an attention mask. Including padding in the "
+                    " attention calculation may cause differences from the Flash Attention implementation."
+                )
+            else:
+                logger.warn_once(
+                    "SDPA attention with an attention mask doesn't use the Flash Attention kernel and will"
+                    " use more memory during the backward pass. Use the FA2 backend for linear memory scaling"
+                    " with sequence length."
+                )
+            if self.sliding_window[0] > 0:
+                raise ValueError("Sliding window is not implemented for the PyTorch SDPA path. Use the FA2 backend.")
+
+    def _init_weights(self, reset_params: bool = False):
+        init_weights(
+            self.config,
+            self.Wo,
+            layer_dim=self.config.hidden_size,
+            layer_id=self.layer_id,
+            type_of_module=ModuleType.out_module,
+        )
+
+    def forward(
+        self,
+        qkv: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        indices: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Perform self-attention.
+
+        There are two attention implementations supported: PyTorch's SDPA attention and Flash Attention 2.
+
+        The arguments are unpadded. The SDPA implementation of attention requires padded arguments while the
+        Flash Attention implementation does not. If using SDPA we first call `pad_input`. Once we compute
+        attention, we re-unpad our outputs for the other layers. The pad/unpad operations add overhead, but not
+        sending pad tokens through ffs saves compute.
+
+        Args:
+            qkv: (total_nnz, 3 * dim)
+            cu_seqlens: (batch + 1,)
+            max_seqlen: int
+            indices: (total_nnz,)
+            attn_mask: (batch, max_seqlen)
+
+        Returns:
+            attention: (total_nnz, dim)
+        """
+        bs = qkv.shape[0]
+        dim = self.hidden_size
+
+        # only needed for inference when we have KV cache
+        seqlen_offset = 0
+
+        # (total_seqlen, 3, nheads, headdim)
+        qkv = qkv.view(-1, 3, self.num_attention_heads, self.attn_head_size)
+        qkv = self.rotary_emb(qkv, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, seqlen_offset=seqlen_offset)
+
+        qkv = bert_padding.pad_input(
+            qkv, indices, cu_seqlens.shape[0] - 1, attn_mask.shape[-1]
+        )  # batch, max_seqlen, thd
+        unpad_bs, seqlen, *_ = qkv.shape
+
+        q, k, v = qkv.transpose(3, 1).unbind(dim=2)  # b h s d
+        breakpoint()
+        if self.use_parallel_softpick:
+            logger.warn_once(
+                "Ussing parallel softpick attention assume we are using causal masking! Write new kernel dude"
+            )
+            attn = parallel_softpick_attn(
+                q,
+                k,
+                v,
+                scale=self.attn_head_size**-0.5,
+                head_first=True
+            )
+        else:
+            logger.warn_once(
+                "Using naive softpick attention. This is not recommended for production use."
+            )
+            attn, _ = naive_softpick_attn(
+                q,
+                k,
+                v,
+                mask=attn_mask[:, None, None, :seqlen].to(torch.bool).expand(unpad_bs, 1, seqlen, seqlen),
+                scale=self.attn_head_size**-0.5,
+                head_first=True,
+            )
+        attn = rearrange(attn, "b h s d -> b s (h d)")
+        attn = bert_padding.unpad_input_only(attn, torch.squeeze(attn_mask) == 1)
+        return self.out_drop(self.Wo(attn))
+
 class FlexBertUnpadRopeParallelAttention(FlexBertAttentionBase):
     """Performs multi-headed self attention on a batch of unpadded sequences.
 
@@ -1261,6 +1426,137 @@ class FlexBertUnpadRopeParallelAttention(FlexBertAttentionBase):
 
         return self.out_drop(self.Wo(attn))
 
+
+class FlexBertPaddedRopeParallelSoftpickAttention(FlexBertAttentionBase):
+    """Performs multi-headed self attention on a batch of padded sequences.
+
+    This module supports two attention implementations:
+    1. Flash Attention 2 (if installed), which improves throughput.
+    2. PyTorch's scaled_dot_product_attention.
+
+    See `forward` method for additional details.
+    """
+
+    def __init__(self, config: FlexBertConfig, layer_id: Optional[int] = None):
+        super().__init__(config=config, layer_id=layer_id)
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
+            raise ValueError(
+                f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
+                f"heads ({config.num_attention_heads})"
+            )
+
+        self.num_attention_heads = config.num_attention_heads
+        self.attn_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.hidden_size = config.hidden_size
+        self.p_dropout = config.attention_probs_dropout_prob
+        self.Wo = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attn_out_bias)
+        self.out_drop = (
+            nn.Dropout(config.attn_out_dropout_prob) if config.attn_out_dropout_prob > 0.0 else nn.Identity()
+        )
+
+        self.use_fa2 = config.use_fa2
+        self.deterministic_fa2 = config.deterministic_fa2
+        self.use_sdpa_attn_mask = config.use_sdpa_attn_mask
+        if not IMPL_USE_FLASH2 and self.use_fa2:
+            self.use_fa2 = False
+
+        if config.global_attn_every_n_layers > 0:
+            if config.sliding_window == -1:
+                raise ValueError("global_attn_every_n_layers` requires `sliding_window` to be set")
+            if layer_id % config.global_attn_every_n_layers != 0:
+                self.sliding_window = (config.sliding_window // 2, config.sliding_window // 2)
+            else:
+                self.sliding_window = (-1, -1)
+        else:
+            self.sliding_window = (config.sliding_window // 2, config.sliding_window // 2)
+
+        if config.rotary_emb_dim is None:
+            config.rotary_emb_dim = self.attn_head_size
+
+        rotary_base = config.rotary_emb_base
+        rotary_dim = config.rotary_emb_dim
+        if self.sliding_window != (-1, -1):
+            if config.local_attn_rotary_emb_base != -1:
+                rotary_base = config.local_attn_rotary_emb_base
+            if config.local_attn_rotary_emb_dim is not None:
+                rotary_dim = config.local_attn_rotary_emb_dim
+
+        assert RotaryEmbedding is not None, "rotary_emb is not installed"
+        self.rotary_emb = RotaryEmbedding(
+            dim=rotary_dim,
+            base=rotary_base,
+            scale_base=config.rotary_emb_scale_base,  # If scale_base is not None, this implements XPos (Sun et al., https://arxiv.org/abs/2212.10554).
+            interleaved=config.rotary_emb_interleaved,
+        )
+
+        if not IMPL_USE_FLASH2 and self.use_fa2:
+            self.use_fa2 = False
+        if self.use_fa2 and self.use_sdpa_attn_mask:
+            logger.warn_once(
+                "Flash Attention 2 does not support attention masks. Use unpadded attention "
+                "the equivalent functionality of masking out padding tokens."
+            )
+        if not self.use_fa2 and self.sliding_window[0] > 0:
+            raise ValueError("Sliding window is not implemented for the PyTorch SDPA path. Use the FA2 backend.")
+
+    def _init_weights(self, reset_params: bool = False):
+        init_weights(
+            self.config,
+            self.Wo,
+            layer_dim=self.config.hidden_size,
+            layer_id=self.layer_id,
+            type_of_module=ModuleType.out_module,
+        )
+
+    def forward(
+        self,
+        qkv: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Perform self-attention.
+
+        There are two attention implementations supported:
+        Flash Attention 2 and PyTorch's scaled_dot_product_attention.
+
+        Args:
+            qkv: (batch, seqlen, 3 * dim)
+            attn_mask: (batch, seqlen)
+
+        Returns:
+            attention: (batch, seqlen, dim)
+        """
+        bs, seqlen, _ = qkv.shape
+        dim = self.hidden_size
+
+        seqlen_offset = 0
+
+        # Reshape to (batch, seqlen, 3, nheads, headdim)
+        qkv = qkv.view(bs, seqlen, 3, self.num_attention_heads, self.attn_head_size)
+
+        qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset, max_seqlen=None)
+
+        q, k, v = qkv.transpose(3, 1).unbind(dim=2)  # b h s d
+        if self.use_parallel_softpick:
+            attn = parallel_softpick_attn(
+                q,
+                k,
+                v,
+                scale=self.attn_head_size**-0.5,
+                head_first=True
+            )
+        else:
+            logger.warn_once(
+                "Using naive softpick attention. This is not recommended for production use."
+            )
+            attn = naive_softpick_attn(
+                q,
+                k,
+                v,
+                scale=self.attn_head_size**-0.5,
+                head_first=True,
+            )
+        attn = attn.transpose(1, 2).view(bs, seqlen, dim)
+        return self.out_drop(self.Wo(attn))
 
 class FlexBertPaddedRopeParallelAttention(FlexBertAttentionBase):
     """Performs multi-headed self attention on a batch of padded sequences.
@@ -1539,6 +1835,8 @@ ATTN2CLS = {
     "padded_rope": FlexBertPaddedRopeAttention,
     "unpadded_rope_parallel": FlexBertUnpadRopeParallelAttention,
     "padded_rope_parallel": FlexBertPaddedRopeParallelAttention,
+    "unpadded_rope_parallel_softpick": FlexBertUnpadRopeParallelSoftpickAttention,
+    "padded_rope_parallel_softpick": FlexBertPaddedRopeParallelSoftpickAttention,
 }
 
 
