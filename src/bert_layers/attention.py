@@ -1146,7 +1146,7 @@ class FlexBertUnpadRopeParallelSoftpickAttention(FlexBertAttentionBase):
         self.use_fa2 = config.use_fa2
         self.deterministic_fa2 = config.deterministic_fa2
         self.use_sdpa_attn_mask = config.use_sdpa_attn_mask
-        self.use_parallel_softpick = config.use_parallel_softpick if hasattr(config, "use_parallel_softpick") else False
+        self.use_parallel_softpick = False
 
         # Warn if defaulting to pytorch because of import issues
         if not IMPL_USE_FLASH2 and self.use_fa2:
@@ -1222,7 +1222,7 @@ class FlexBertUnpadRopeParallelSoftpickAttention(FlexBertAttentionBase):
         unpad_bs, seqlen, *_ = qkv.shape
 
         q, k, v = qkv.transpose(3, 1).unbind(dim=2)  # b h s d
-        if True:
+        if False:
             q = rearrange(q, "b h s d -> b s h d")
             k = rearrange(k, "b h s d -> b s h d")
             v = rearrange(v, "b h s d -> b s h d")
@@ -1484,8 +1484,7 @@ class FlexBertPaddedRopeParallelSoftpickAttention(FlexBertAttentionBase):
         self.out_drop = (
             nn.Dropout(config.attn_out_dropout_prob) if config.attn_out_dropout_prob > 0.0 else nn.Identity()
         )
-        self.use_parallel_softpick = config.use_parallel_softpick if hasattr(config, "use_parallel_softpick") else False
-
+        self.use_parallel_softpick = False
         self.use_fa2 = config.use_fa2
         self.deterministic_fa2 = config.deterministic_fa2
         self.use_sdpa_attn_mask = config.use_sdpa_attn_mask
