@@ -1567,8 +1567,7 @@ class FlexBertPaddedRopeParallelSoftpickAttention(FlexBertAttentionBase):
         qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset, max_seqlen=None)
 
         q, k, v = qkv.transpose(3, 1).unbind(dim=2)  # b h s d
-        breakpoint()
-        if self.use_parallel_softpick:
+        if False:
             q = rearrange(q, "b h s d -> b s h d")
             k = rearrange(q, "b h s d -> b s h d")
             v = rearrange(q, "b h s d -> b s h d")

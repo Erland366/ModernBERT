@@ -66,7 +66,7 @@ model:
     global_attn_every_n_layers: 3
     unpad_embeddings: true
     pad_logits: false
-    use_parallel_softpick: true
+    use_parallel_softpick: false
 
 # Dataloaders
 train_loader:
@@ -148,9 +148,9 @@ loggers:
 #     entity:      # Fill this in
 
 # (Optional) Checkpoint to local filesystem or remote object store
-# save_interval: 3500ba
-# save_num_checkpoints_to_keep: 1  # Important, this cleans up checkpoints saved to DISK
-# save_folder:      # e.g. './{run_name}/ckpt' (local) or 's3://mybucket/mydir/{run_name}/ckpt' (remote)
+save_interval: 3500ba
+save_num_checkpoints_to_keep: 1  # Important, this cleans up checkpoints saved to DISK
+save_folder:      # e.g. './{run_name}/ckpt' (local) or 's3://mybucket/mydir/{run_name}/ckpt' (remote)
 
 # (Optional) Load from local filesystem or remote object store to
 # start from an existing model checkpoint;
