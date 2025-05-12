@@ -167,3 +167,5 @@ wandb/
 
 # OS X
 .DS_Store
+my-copy-c4/*
+testing_chamber/*
