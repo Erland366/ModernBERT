@@ -1147,6 +1147,7 @@ class FlexBertUnpadRopeParallelSoftpickAttention(FlexBertAttentionBase):
         self.deterministic_fa2 = config.deterministic_fa2
         self.use_sdpa_attn_mask = config.use_sdpa_attn_mask
         self.use_parallel_softpick = False
+        self._captured_attention_probabilities = None
 
         # Warn if defaulting to pytorch because of import issues
         if not IMPL_USE_FLASH2 and self.use_fa2:
@@ -1269,7 +1270,7 @@ class FlexBertUnpadRopeParallelSoftpickAttention(FlexBertAttentionBase):
             logger.warn_once(
                 "Using naive softpick attention. This is not recommended for production use."
             )
-            attn, _ = naive_softpick_attn(
+            attn, attention_map = naive_softpick_attn(
                 q,
                 k,
                 v,
@@ -1277,6 +1278,11 @@ class FlexBertUnpadRopeParallelSoftpickAttention(FlexBertAttentionBase):
                 scale=self.attn_head_size**-0.5,
                 head_first=True,
             )
+            if attention_map is not None:
+                self._captured_attention_probabilities = attention_map.detach().clone()
+            else:
+                self._captured_attention_probabilities = None 
+
         attn = rearrange(attn, "b h s d -> b s (h d)")
         attn = bert_padding.unpad_input_only(attn, torch.squeeze(attn_mask) == 1)
         return self.out_drop(self.Wo(attn))
